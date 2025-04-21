@@ -18,9 +18,9 @@ st.set_page_config(
 )
 
 # Alpaca API credentials
-API_KEY = "PKTR490WK796PV2BCEZ3"
-API_SECRET = "iMX9xTr66T0Fra84bTFpglrNkcZh5hATGQjEIsoa"
-BASE_URL = "https://paper-api.alpaca.markets"
+API_KEY = "AKK4GI8YGPG61QDGV4H8"
+API_SECRET = "h3EDm5WAElI7OH5cQX3zIcfC4vFK0tzHeFTvAXPD"
+BASE_URL = "https://api.alpaca.markets"
 
 # Initialize Alpaca API
 api = tradeapi.REST(API_KEY, API_SECRET, BASE_URL, api_version='v2')
