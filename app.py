@@ -6,7 +6,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import time
 from datetime import datetime, timedelta
-import talib
+import pandas_ta as ta  # Using pandas-ta instead of TA-Lib
 import requests
 import json
 
@@ -58,7 +58,7 @@ def fetch_stock_data(symbol, timeframe, limit=100):
         st.error(f"Error fetching data for {symbol}: {e}")
         return pd.DataFrame()
 
-# Calculate indicators
+# Calculate indicators using pandas_ta instead of TA-Lib
 def calculate_indicators(df):
     if len(df) < 50:  # Ensure we have enough data
         return df
@@ -68,50 +68,46 @@ def calculate_indicators(df):
     
     # MACD
     try:
-        df['macd'], df['macd_signal'], df['macd_hist'] = talib.MACD(
-            df['close'], 
-            fastperiod=12, 
-            slowperiod=26, 
-            signalperiod=9
-        )
+        macd = ta.macd(df['close'], fast=12, slow=26, signal=9)
+        df['macd'] = macd['MACD_12_26_9']
+        df['macd_signal'] = macd['MACDs_12_26_9']
+        df['macd_hist'] = macd['MACDh_12_26_9']
         
         # Add MACD crossover signals
         df['macd_cross_up'] = (df['macd'] > df['macd_signal']) & (df['macd'].shift() <= df['macd_signal'].shift())
         df['macd_cross_down'] = (df['macd'] < df['macd_signal']) & (df['macd'].shift() >= df['macd_signal'].shift())
-    except:
-        st.warning("Not enough data for MACD calculation")
+    except Exception as e:
+        st.warning(f"Not enough data for MACD calculation: {e}")
     
     # RSI
     try:
-        df['rsi'] = talib.RSI(df['close'], timeperiod=14)
-    except:
-        st.warning("Not enough data for RSI calculation")
+        df['rsi'] = ta.rsi(df['close'], length=14)
+    except Exception as e:
+        st.warning(f"Not enough data for RSI calculation: {e}")
     
     # Bollinger Bands
     try:
-        df['bb_upper'], df['bb_middle'], df['bb_lower'] = talib.BBANDS(
-            df['close'], 
-            timeperiod=20,
-            nbdevup=2,
-            nbdevdn=2
-        )
+        bbands = ta.bbands(df['close'], length=20, std=2)
+        df['bb_upper'] = bbands['BBU_20_2.0']
+        df['bb_middle'] = bbands['BBM_20_2.0']
+        df['bb_lower'] = bbands['BBL_20_2.0']
         df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['bb_middle']
         df['bb_pct_b'] = (df['close'] - df['bb_lower']) / (df['bb_upper'] - df['bb_lower'])
-    except:
-        st.warning("Not enough data for Bollinger Bands calculation")
+    except Exception as e:
+        st.warning(f"Not enough data for Bollinger Bands calculation: {e}")
     
     # EMA values
     try:
-        df['ema8'] = talib.EMA(df['close'], timeperiod=8)
-        df['ema21'] = talib.EMA(df['close'], timeperiod=21)
-        df['ema50'] = talib.EMA(df['close'], timeperiod=50)
-        df['ema200'] = talib.EMA(df['close'], timeperiod=200)
+        df['ema8'] = ta.ema(df['close'], length=8)
+        df['ema21'] = ta.ema(df['close'], length=21)
+        df['ema50'] = ta.ema(df['close'], length=50)
+        df['ema200'] = ta.ema(df['close'], length=200)
         
         # EMA Cloud (bullish when ema8 > ema21)
         df['ema_cloud_bullish'] = df['ema8'] > df['ema21']
         df['ema_trend'] = df['ema50'] > df['ema200']
-    except:
-        st.warning("Not enough data for EMA calculation")
+    except Exception as e:
+        st.warning(f"Not enough data for EMA calculation: {e}")
     
     # Volume analysis
     try:
@@ -119,16 +115,17 @@ def calculate_indicators(df):
         df['volume_z_score'] = (df['volume'] - df['volume_sma20']) / df['volume'].rolling(window=20).std()
         
         # On Balance Volume
-        df['obv'] = talib.OBV(df['close'], df['volume'])
+        df['obv'] = ta.obv(df['close'], df['volume'])
         df['obv_sma'] = df['obv'].rolling(window=20).mean()
-    except:
-        st.warning("Not enough data for volume analysis")
+    except Exception as e:
+        st.warning(f"Not enough data for volume analysis: {e}")
     
     # ADX (Average Directional Index) for trend strength
     try:
-        df['adx'] = talib.ADX(df['high'], df['low'], df['close'], timeperiod=14)
-    except:
-        st.warning("Not enough data for ADX calculation")
+        adx = ta.adx(df['high'], df['low'], df['close'], length=14)
+        df['adx'] = adx['ADX_14']
+    except Exception as e:
+        st.warning(f"Not enough data for ADX calculation: {e}")
     
     return df
 
@@ -479,8 +476,12 @@ def plot_chart(df, symbol, timeframe):
 
 # Check if market is open
 def is_market_open():
-    clock = api.get_clock()
-    return clock.is_open
+    try:
+        clock = api.get_clock()
+        return clock.is_open
+    except Exception as e:
+        st.error(f"Error checking market status: {e}")
+        return False
 
 # Get universe of stocks 
 def get_stock_universe():
@@ -492,25 +493,30 @@ def get_stock_universe():
     ]
     
     try:
-        # Get S&P 500 stocks
-        sp500_url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        tables = pd.read_html(sp500_url)
-        sp500_stocks = tables[0]['Symbol'].tolist()
-        
-        # Clean up symbols
-        sp500_stocks = [symbol.replace('.', '-') for symbol in sp500_stocks]
-        
-        return sp500_stocks
-    except:
-        # If unable to get S&P 500 list, return default stocks
+        # Get S&P 500 stocks (simplified approach)
+        url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+        tables = pd.read_html(url)
+        if len(tables) > 0 and 'Symbol' in tables[0].columns:
+            sp500_stocks = tables[0]['Symbol'].tolist()
+            # Clean up symbols
+            sp500_stocks = [symbol.replace('.', '-') for symbol in sp500_stocks]
+            return sp500_stocks
+        else:
+            return default_stocks
+    except Exception as e:
+        st.warning(f"Unable to fetch S&P 500 list, using default stocks: {e}")
         return default_stocks
 
 # Scan for signals across multiple stocks
 def scan_for_signals(stocks, timeframe, min_confidence=65):
     all_signals = []
+    progress_bar = st.progress(0)
     
-    for symbol in stocks:
+    for i, symbol in enumerate(stocks):
         try:
+            # Update progress
+            progress_bar.progress((i + 1) / len(stocks))
+            
             df = fetch_stock_data(symbol, timeframe)
             if df.empty:
                 continue
@@ -556,21 +562,6 @@ def show_dashboard():
         index=3  # Default to 1hour
     )
     
-    # Indicator settings
-    st.sidebar.header("Indicator Settings")
-    
-    with st.sidebar.expander("MACD Settings"):
-        macd_fast = st.number_input("MACD Fast Period", value=12, min_value=2, max_value=50)
-        macd_slow = st.number_input("MACD Slow Period", value=26, min_value=5, max_value=100)
-        macd_signal = st.number_input("MACD Signal Period", value=9, min_value=2, max_value=50)
-    
-    with st.sidebar.expander("RSI Settings"):
-        rsi_period = st.number_input("RSI Period", value=14, min_value=2, max_value=50)
-    
-    with st.sidebar.expander("Bollinger Bands Settings"):
-        bb_period = st.number_input("BB Period", value=20, min_value=5, max_value=50)
-        bb_std_dev = st.number_input("BB Standard Deviation", value=2.0, min_value=0.5, max_value=4.0, step=0.1)
-    
     # Auto refresh option
     auto_refresh = st.sidebar.checkbox("Auto Refresh Data", value=False)
     refresh_interval = st.sidebar.slider("Refresh Interval (seconds)", 30, 300, 60)
@@ -588,10 +579,12 @@ def show_dashboard():
     
     with col1:
         # Get data and calculate indicators
-        data = fetch_stock_data(symbol, timeframe)
+        with st.spinner("Fetching data..."):
+            data = fetch_stock_data(symbol, timeframe)
         
         if not data.empty:
-            data_with_indicators = calculate_indicators(data)
+            with st.spinner("Calculating indicators..."):
+                data_with_indicators = calculate_indicators(data)
             
             # Plot chart
             fig = plot_chart(data_with_indicators, symbol, timeframe)
@@ -758,7 +751,7 @@ def show_documentation():
         **What it is**: The MACD is a trend-following momentum indicator that shows the relationship between two moving averages of a security's price.
         
         **How it's calculated**: 
-        - MACD Line = 12-period EMA - 26-period EMA
+        - MACD Line = 12-period EMA -26-period EMA
         - Signal Line = 9-period EMA of MACD Line
         - Histogram = MACD Line - Signal Line
         
