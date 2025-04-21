@@ -6,6 +6,6 @@ plotly
 python-dateutil
 pytz
 requests
-TA-Lib
 scipy
 lxml
+pandas-ta
