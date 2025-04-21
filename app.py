@@ -1,13 +1,16 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import alpaca_trade_api as tradeapi
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import time
 from datetime import datetime, timedelta
+import pytz
 import requests
 import json
+import traceback
+import alpaca_trade_api as tradeapi
+import yfinance as yf  # Fallback data source
 
 # Set page configuration
 st.set_page_config(
@@ -23,43 +26,105 @@ API_SECRET = "h3EDm5WAElI7OH5cQX3zIcfC4vFK0tzHeFTvAXPD"
 BASE_URL = "https://api.alpaca.markets"
 
 # Initialize Alpaca API
-api = tradeapi.REST(API_KEY, API_SECRET, BASE_URL, api_version='v2')
+try:
+    api = tradeapi.REST(API_KEY, API_SECRET, BASE_URL, api_version='v2')
+except Exception as e:
+    st.warning(f"Could not initialize Alpaca API: {e}")
+    api = None
+
+# Use Yahoo Finance as fallback
+def fetch_yfinance_data(symbol, timeframe, limit=100):
+    """Fetch data from Yahoo Finance as a fallback"""
+    try:
+        # Convert timeframe to yfinance interval
+        if timeframe == '1min':
+            interval = '1m'
+            period = '1d'  # YFinance only provides 1m data for last 7 days
+        elif timeframe == '5min':
+            interval = '5m'
+            period = '5d'
+        elif timeframe == '15min':
+            interval = '15m'
+            period = '5d'
+        elif timeframe == '1hour':
+            interval = '1h'
+            period = '5d'
+        else:  # '1day'
+            interval = '1d'
+            period = '100d'
+        
+        # Fetch data from yfinance
+        data = yf.download(symbol, period=period, interval=interval)
+        
+        # Reset index to make date a column
+        data = data.reset_index()
+        
+        # Rename columns to match Alpaca format
+        data = data.rename(columns={
+            'Date': 'timestamp',
+            'Open': 'open',
+            'High': 'high',
+            'Low': 'low',
+            'Close': 'close',
+            'Volume': 'volume'
+        })
+        
+        # Limit to the requested number of bars
+        data = data.tail(limit)
+        
+        return data
+    except Exception as e:
+        st.error(f"Error fetching data from Yahoo Finance for {symbol}: {e}")
+        return pd.DataFrame()
 
 # Cache function for data fetching to avoid repeated API calls
 @st.cache_data(ttl=60)  # Cache data for 60 seconds
 def fetch_stock_data(symbol, timeframe, limit=100):
-    try:
-        # Convert timeframe for Alpaca API
-        if timeframe == '1min':
-            timeframe_api = '1Min'
-        elif timeframe == '5min':
-            timeframe_api = '5Min'
-        elif timeframe == '15min':
-            timeframe_api = '15Min'
-        elif timeframe == '1hour':
-            timeframe_api = '1Hour'
-        else:  # '1day'
-            timeframe_api = '1Day'
-        
-        # Fetch data from Alpaca
-        bars = api.get_bars(symbol, timeframe_api, limit=limit).df
-        
-        # Reset index to make date a column
-        bars = bars.reset_index()
-        
-        # For live data, add current time if not already in the data
-        if bars.empty or (datetime.now() - bars['timestamp'].iloc[-1]).total_seconds() > 300:
-            # No recent data, might be outside market hours or a holiday
-            st.info(f"No recent data available for {symbol}. This could be due to market hours or a holiday.")
-        
-        return bars
-    except Exception as e:
-        st.error(f"Error fetching data for {symbol}: {e}")
-        return pd.DataFrame()
+    """Fetch stock data with error handling and fallback options"""
+    # First, try Alpaca API
+    if api is not None:
+        try:
+            # Convert timeframe for Alpaca API
+            if timeframe == '1min':
+                timeframe_api = '1Min'
+            elif timeframe == '5min':
+                timeframe_api = '5Min'
+            elif timeframe == '15min':
+                timeframe_api = '15Min'
+            elif timeframe == '1hour':
+                timeframe_api = '1Hour'
+            else:  # '1day'
+                timeframe_api = '1Day'
+            
+            # Fetch data from Alpaca
+            bars = api.get_bars(symbol, timeframe_api, limit=limit).df
+            
+            # Reset index to make date a column
+            bars = bars.reset_index()
+            
+            # Ensure we have data
+            if bars.empty:
+                # Try YFinance as fallback
+                st.info(f"No data available from Alpaca for {symbol}. Trying Yahoo Finance...")
+                return fetch_yfinance_data(symbol, timeframe, limit)
+            
+            return bars
+            
+        except Exception as e:
+            st.warning(f"Error fetching data from Alpaca for {symbol}: {e}")
+            st.info("Trying Yahoo Finance as fallback...")
+            # Fallback to Yahoo Finance
+            return fetch_yfinance_data(symbol, timeframe, limit)
+    else:
+        # If Alpaca API is not initialized, use Yahoo Finance
+        st.info("Using Yahoo Finance for data (Alpaca API not available)")
+        return fetch_yfinance_data(symbol, timeframe, limit)
 
 # Custom indicator calculation functions
 def calculate_indicators(df):
-    if len(df) < 50:  # Ensure we have enough data
+    """Calculate all technical indicators from scratch"""
+    if len(df) < 30:  # Ensure we have enough data
+        st.warning("Not enough data for reliable indicator calculation")
         return df
     
     # Make a copy to avoid SettingWithCopyWarning
@@ -105,6 +170,9 @@ def calculate_indicators(df):
         avg_gain = gain.rolling(window=14).mean()
         avg_loss = loss.rolling(window=14).mean()
         
+        # Handle division by zero
+        avg_loss = avg_loss.replace(0, 0.001)
+        
         # Calculate RS and RSI
         rs = avg_gain / avg_loss
         df['rsi'] = 100 - (100 / (1 + rs))
@@ -145,10 +213,12 @@ def calculate_indicators(df):
         
         # Volume Z-score
         df['volume_std'] = df['volume'].rolling(window=20).std()
+        # Handle division by zero
+        df['volume_std'] = df['volume_std'].replace(0, 0.001)
         df['volume_z_score'] = (df['volume'] - df['volume_sma20']) / df['volume_std']
         
         # On Balance Volume (OBV)
-        obv = pd.Series(index=df.index)
+        obv = pd.Series(index=df.index, dtype='float64')
         obv.iloc[0] = 0
         
         for i in range(1, len(df)):
@@ -183,11 +253,17 @@ def calculate_indicators(df):
         smooth_period = 14
         
         # Simple moving average of +DM, -DM and TR
-        df['plus_di'] = 100 * df['plus_dm'].rolling(window=smooth_period).mean() / df['tr'].rolling(window=smooth_period).mean()
-        df['minus_di'] = 100 * df['minus_dm'].rolling(window=smooth_period).mean() / df['tr'].rolling(window=smooth_period).mean()
+        # Handle division by zero
+        tr_sma = df['tr'].rolling(window=smooth_period).mean()
+        tr_sma = tr_sma.replace(0, 0.001)
+        
+        df['plus_di'] = 100 * df['plus_dm'].rolling(window=smooth_period).mean() / tr_sma
+        df['minus_di'] = 100 * df['minus_dm'].rolling(window=smooth_period).mean() / tr_sma
         
         # Calculate DX
-        df['dx'] = 100 * abs(df['plus_di'] - df['minus_di']) / (df['plus_di'] + df['minus_di'])
+        dx_denominator = df['plus_di'] + df['minus_di']
+        dx_denominator = dx_denominator.replace(0, 0.001)  # Handle division by zero
+        df['dx'] = 100 * abs(df['plus_di'] - df['minus_di']) / dx_denominator
         
         # Calculate ADX
         df['adx'] = df['dx'].rolling(window=smooth_period).mean()
@@ -198,8 +274,9 @@ def calculate_indicators(df):
 
 # Generate trading signals
 def generate_signals(df):
-    if df.empty or len(df) < 50:
-        return []
+    """Generate trading signals based on indicators"""
+    if df.empty or len(df) < 30:
+        return None
     
     signals = []
     confidence_score = 50  # Base confidence score
@@ -207,353 +284,387 @@ def generate_signals(df):
     # Check last row for signals
     last_idx = -1
     
-    # MACD Signals
-    if 'macd' in df.columns and 'macd_signal' in df.columns:
-        # Bullish MACD crossover
-        if df['macd_cross_up'].iloc[last_idx]:
-            signals.append({
-                'type': 'BUY',
-                'reason': 'MACD Bullish Crossover',
-                'points': 15
-            })
-            confidence_score += 15
+    try:
+        # MACD Signals
+        if 'macd' in df.columns and 'macd_signal' in df.columns:
+            # Bullish MACD crossover
+            if df['macd_cross_up'].iloc[last_idx]:
+                signals.append({
+                    'type': 'BUY',
+                    'reason': 'MACD Bullish Crossover',
+                    'points': 15
+                })
+                confidence_score += 15
+            
+            # Bearish MACD crossover
+            elif df['macd_cross_down'].iloc[last_idx]:
+                signals.append({
+                    'type': 'SELL',
+                    'reason': 'MACD Bearish Crossover',
+                    'points': 15
+                })
+                confidence_score += 15
         
-        # Bearish MACD crossover
-        elif df['macd_cross_down'].iloc[last_idx]:
-            signals.append({
-                'type': 'SELL',
-                'reason': 'MACD Bearish Crossover',
-                'points': 15
-            })
-            confidence_score += 15
-    
-    # EMA Cloud
-    if 'ema_cloud_bullish' in df.columns:
-        if df['ema_cloud_bullish'].iloc[last_idx]:
-            signals.append({
-                'type': 'BUY',
-                'reason': 'EMA Cloud Bullish (EMA8 > EMA21)',
-                'points': 10
-            })
-            confidence_score += 10
-        else:
-            signals.append({
-                'type': 'SELL',
-                'reason': 'EMA Cloud Bearish (EMA8 < EMA21)',
-                'points': 10
-            })
-            confidence_score += 10
-    
-    # RSI Signals
-    if 'rsi' in df.columns:
-        # Oversold
-        if df['rsi'].iloc[last_idx] < 30:
-            signals.append({
-                'type': 'BUY',
-                'reason': 'RSI Oversold (<30)',
-                'points': 10
-            })
-            confidence_score += 10
-        # Overbought
-        elif df['rsi'].iloc[last_idx] > 70:
-            signals.append({
-                'type': 'SELL',
-                'reason': 'RSI Overbought (>70)',
-                'points': 10
-            })
-            confidence_score += 10
-    
-    # Bollinger Band signals
-    if 'bb_pct_b' in df.columns and 'bb_width' in df.columns:
-        # Price near upper band
-        if df['bb_pct_b'].iloc[last_idx] > 0.9:
-            signals.append({
-                'type': 'SELL',
-                'reason': 'Price near upper Bollinger Band',
-                'points': 10
-            })
-            confidence_score += 10
-        # Price near lower band
-        elif df['bb_pct_b'].iloc[last_idx] < 0.1:
-            signals.append({
-                'type': 'BUY',
-                'reason': 'Price near lower Bollinger Band',
-                'points': 10
-            })
-            confidence_score += 10
+        # EMA Cloud
+        if 'ema_cloud_bullish' in df.columns:
+            if df['ema_cloud_bullish'].iloc[last_idx]:
+                signals.append({
+                    'type': 'BUY',
+                    'reason': 'EMA Cloud Bullish (EMA8 > EMA21)',
+                    'points': 10
+                })
+                confidence_score += 10
+            else:
+                signals.append({
+                    'type': 'SELL',
+                    'reason': 'EMA Cloud Bearish (EMA8 < EMA21)',
+                    'points': 10
+                })
+                confidence_score += 10
         
-        # Bollinger Band squeeze (setup for volatility breakout)
-        if 'bb_width' in df.columns:
-            bb_mean = df['bb_width'].rolling(window=20).mean().iloc[last_idx]
-            if df['bb_width'].iloc[last_idx] < bb_mean * 0.8:
+        # RSI Signals
+        if 'rsi' in df.columns:
+            # Oversold
+            if df['rsi'].iloc[last_idx] < 30:
+                signals.append({
+                    'type': 'BUY',
+                    'reason': 'RSI Oversold (<30)',
+                    'points': 10
+                })
+                confidence_score += 10
+            # Overbought
+            elif df['rsi'].iloc[last_idx] > 70:
+                signals.append({
+                    'type': 'SELL',
+                    'reason': 'RSI Overbought (>70)',
+                    'points': 10
+                })
+                confidence_score += 10
+        
+        # Bollinger Band signals
+        if 'bb_pct_b' in df.columns:
+            # Price near upper band
+            if df['bb_pct_b'].iloc[last_idx] > 0.9:
+                signals.append({
+                    'type': 'SELL',
+                    'reason': 'Price near upper Bollinger Band',
+                    'points': 10
+                })
+                confidence_score += 10
+            # Price near lower band
+            elif df['bb_pct_b'].iloc[last_idx] < 0.1:
+                signals.append({
+                    'type': 'BUY',
+                    'reason': 'Price near lower Bollinger Band',
+                    'points': 10
+                })
+                confidence_score += 10
+            
+            # Bollinger Band squeeze (setup for volatility breakout)
+            if 'bb_width' in df.columns:
+                bb_mean = df['bb_width'].rolling(window=20).mean().iloc[last_idx]
+                if df['bb_width'].iloc[last_idx] < bb_mean * 0.8:
+                    signals.append({
+                        'type': 'NEUTRAL',
+                        'reason': 'Bollinger Band Squeeze (potential breakout setup)',
+                        'points': 5
+                    })
+                    confidence_score += 5
+        
+        # Volume confirmation
+        if 'volume_z_score' in df.columns:
+            if df['volume_z_score'].iloc[last_idx] > 1.5:
+                # High volume confirms the direction
+                direction = 'BUY' if df['close'].iloc[last_idx] > df['close'].iloc[last_idx-1] else 'SELL'
+                signals.append({
+                    'type': direction,
+                    'reason': 'High Volume Confirmation',
+                    'points': 10
+                })
+                confidence_score += 10
+        
+        # ADX - Strong trend
+        if 'adx' in df.columns:
+            if df['adx'].iloc[last_idx] > 25:
                 signals.append({
                     'type': 'NEUTRAL',
-                    'reason': 'Bollinger Band Squeeze (potential breakout setup)',
-                    'points': 5
+                    'reason': 'Strong Trend (ADX > 25)',
+                    'points': 10
                 })
-                confidence_score += 5
+                confidence_score += 10
+        
+        # Determine overall signal direction and confidence
+        buy_points = sum(signal['points'] for signal in signals if signal['type'] == 'BUY')
+        sell_points = sum(signal['points'] for signal in signals if signal['type'] == 'SELL')
+        
+        # Calculate final confidence (cap at 95)
+        final_confidence = min(95, confidence_score)
+        
+        # Determine overall signal
+        if buy_points > sell_points and final_confidence >= 65:
+            overall_signal = {
+                'direction': 'BUY',
+                'confidence': final_confidence,
+                'signals': signals,
+                'reasons': [s['reason'] for s in signals if s['type'] == 'BUY' or s['type'] == 'NEUTRAL']
+            }
+        elif sell_points > buy_points and final_confidence >= 65:
+            overall_signal = {
+                'direction': 'SELL',
+                'confidence': final_confidence,
+                'signals': signals,
+                'reasons': [s['reason'] for s in signals if s['type'] == 'SELL' or s['type'] == 'NEUTRAL']
+            }
+        else:
+            overall_signal = {
+                'direction': 'NEUTRAL',
+                'confidence': final_confidence,
+                'signals': signals,
+                'reasons': [s['reason'] for s in signals if s['type'] == 'NEUTRAL']
+            }
+        
+        return overall_signal
     
-    # Volume confirmation
-    if 'volume_z_score' in df.columns:
-        if df['volume_z_score'].iloc[last_idx] > 1.5:
-            # High volume confirms the direction
-            direction = 'BUY' if df['close'].iloc[last_idx] > df['close'].iloc[last_idx-1] else 'SELL'
-            signals.append({
-                'type': direction,
-                'reason': 'High Volume Confirmation',
-                'points': 10
-            })
-            confidence_score += 10
-    
-    # ADX - Strong trend
-    if 'adx' in df.columns:
-        if df['adx'].iloc[last_idx] > 25:
-            signals.append({
-                'type': 'NEUTRAL',
-                'reason': 'Strong Trend (ADX > 25)',
-                'points': 10
-            })
-            confidence_score += 10
-    
-    # Determine overall signal direction and confidence
-    buy_points = sum(signal['points'] for signal in signals if signal['type'] == 'BUY')
-    sell_points = sum(signal['points'] for signal in signals if signal['type'] == 'SELL')
-    
-    # Calculate final confidence (cap at 95)
-    final_confidence = min(95, confidence_score)
-    
-    # Determine overall signal
-    if buy_points > sell_points and final_confidence >= 65:
-        overall_signal = {
-            'direction': 'BUY',
-            'confidence': final_confidence,
-            'signals': signals,
-            'reasons': [s['reason'] for s in signals if s['type'] == 'BUY' or s['type'] == 'NEUTRAL']
-        }
-    elif sell_points > buy_points and final_confidence >= 65:
-        overall_signal = {
-            'direction': 'SELL',
-            'confidence': final_confidence,
-            'signals': signals,
-            'reasons': [s['reason'] for s in signals if s['type'] == 'SELL' or s['type'] == 'NEUTRAL']
-        }
-    else:
-        overall_signal = {
-            'direction': 'NEUTRAL',
-            'confidence': final_confidence,
-            'signals': signals,
-            'reasons': [s['reason'] for s in signals if s['type'] == 'NEUTRAL']
-        }
-    
-    return overall_signal
+    except Exception as e:
+        st.error(f"Error generating signals: {e}")
+        st.code(traceback.format_exc())
+        return None
 
 # Plot chart with indicators
 def plot_chart(df, symbol, timeframe):
+    """Create a plotly chart with price and indicators"""
     if df.empty or len(df) < 20:
         st.error("Not enough data to plot chart")
-        return
+        return None
     
-    # Create subplots
-    fig = make_subplots(rows=4, cols=1, 
-                         shared_xaxes=True, 
-                         vertical_spacing=0.02, 
-                         row_heights=[0.5, 0.15, 0.15, 0.2])
-    
-    # Add price candlestick
-    fig.add_trace(
-        go.Candlestick(
-            x=df['timestamp'],
-            open=df['open'],
-            high=df['high'],
-            low=df['low'],
-            close=df['close'],
-            name='Price'
-        ),
-        row=1, col=1
-    )
-    
-    # Add Bollinger Bands if available
-    if 'bb_upper' in df.columns and 'bb_middle' in df.columns and 'bb_lower' in df.columns:
+    try:
+        # Create subplots
+        fig = make_subplots(rows=4, cols=1, 
+                            shared_xaxes=True, 
+                            vertical_spacing=0.02, 
+                            row_heights=[0.5, 0.15, 0.15, 0.2])
+        
+        # Add price candlestick
         fig.add_trace(
-            go.Scatter(
+            go.Candlestick(
                 x=df['timestamp'],
-                y=df['bb_upper'],
-                name='BB Upper',
-                line=dict(color='rgba(250, 0, 0, 0.5)'),
+                open=df['open'],
+                high=df['high'],
+                low=df['low'],
+                close=df['close'],
+                name='Price'
             ),
             row=1, col=1
         )
         
-        fig.add_trace(
-            go.Scatter(
-                x=df['timestamp'],
-                y=df['bb_middle'],
-                name='BB Middle',
-                line=dict(color='rgba(0, 0, 250, 0.5)'),
-            ),
-            row=1, col=1
-        )
+        # Add Bollinger Bands if available
+        if all(col in df.columns for col in ['bb_upper', 'bb_middle', 'bb_lower']):
+            fig.add_trace(
+                go.Scatter(
+                    x=df['timestamp'],
+                    y=df['bb_upper'],
+                    name='BB Upper',
+                    line=dict(color='rgba(250, 0, 0, 0.5)'),
+                ),
+                row=1, col=1
+            )
+            
+            fig.add_trace(
+                go.Scatter(
+                    x=df['timestamp'],
+                    y=df['bb_middle'],
+                    name='BB Middle',
+                    line=dict(color='rgba(0, 0, 250, 0.5)'),
+                ),
+                row=1, col=1
+            )
+            
+            fig.add_trace(
+                go.Scatter(
+                    x=df['timestamp'],
+                    y=df['bb_lower'],
+                    name='BB Lower',
+                    line=dict(color='rgba(0, 250, 0, 0.5)'),
+                ),
+                row=1, col=1
+            )
         
-        fig.add_trace(
-            go.Scatter(
-                x=df['timestamp'],
-                y=df['bb_lower'],
-                name='BB Lower',
-                line=dict(color='rgba(0, 250, 0, 0.5)'),
-            ),
-            row=1, col=1
-        )
-    
-    # Add EMAs if available
-    if 'ema8' in df.columns:
-        fig.add_trace(
-            go.Scatter(
-                x=df['timestamp'],
-                y=df['ema8'],
-                name='EMA 8',
-                line=dict(color='purple', width=1),
-            ),
-            row=1, col=1
-        )
-    
-    if 'ema21' in df.columns:
-        fig.add_trace(
-            go.Scatter(
-                x=df['timestamp'],
-                y=df['ema21'],
-                name='EMA 21',
-                line=dict(color='orange', width=1),
-            ),
-            row=1, col=1
-        )
-    
-    # Add MACD
-    if 'macd' in df.columns and 'macd_signal' in df.columns and 'macd_hist' in df.columns:
-        fig.add_trace(
-            go.Scatter(
-                x=df['timestamp'],
-                y=df['macd'],
-                name='MACD',
-                line=dict(color='blue', width=1.5),
-            ),
-            row=2, col=1
-        )
+        # Add EMAs if available
+        if 'ema8' in df.columns:
+            fig.add_trace(
+                go.Scatter(
+                    x=df['timestamp'],
+                    y=df['ema8'],
+                    name='EMA 8',
+                    line=dict(color='purple', width=1),
+                ),
+                row=1, col=1
+            )
         
-        fig.add_trace(
-            go.Scatter(
-                x=df['timestamp'],
-                y=df['macd_signal'],
-                name='MACD Signal',
-                line=dict(color='red', width=1.5),
-            ),
-            row=2, col=1
-        )
+        if 'ema21' in df.columns:
+            fig.add_trace(
+                go.Scatter(
+                    x=df['timestamp'],
+                    y=df['ema21'],
+                    name='EMA 21',
+                    line=dict(color='orange', width=1),
+                ),
+                row=1, col=1
+            )
         
-        # MACD histogram
-        colors = ['green' if val >= 0 else 'red' for val in df['macd_hist']]
+        # Add MACD
+        if all(col in df.columns for col in ['macd', 'macd_signal', 'macd_hist']):
+            fig.add_trace(
+                go.Scatter(
+                    x=df['timestamp'],
+                    y=df['macd'],
+                    name='MACD',
+                    line=dict(color='blue', width=1.5),
+                ),
+                row=2, col=1
+            )
+            
+            fig.add_trace(
+                go.Scatter(
+                    x=df['timestamp'],
+                    y=df['macd_signal'],
+                    name='MACD Signal',
+                    line=dict(color='red', width=1.5),
+                ),
+                row=2, col=1
+            )
+            
+            # MACD histogram
+            colors = ['green' if val >= 0 else 'red' for val in df['macd_hist']]
+            fig.add_trace(
+                go.Bar(
+                    x=df['timestamp'],
+                    y=df['macd_hist'],
+                    name='MACD Histogram',
+                    marker_color=colors
+                ),
+                row=2, col=1
+            )
+        
+        # Add RSI
+        if 'rsi' in df.columns:
+            fig.add_trace(
+                go.Scatter(
+                    x=df['timestamp'],
+                    y=df['rsi'],
+                    name='RSI',
+                    line=dict(color='blue', width=1),
+                ),
+                row=3, col=1
+            )
+            
+            # Add RSI overbought/oversold levels
+            fig.add_trace(
+                go.Scatter(
+                    x=df['timestamp'],
+                    y=[70] * len(df),
+                    name='Overbought',
+                    line=dict(color='red', width=1, dash='dash'),
+                ),
+                row=3, col=1
+            )
+            
+            fig.add_trace(
+                go.Scatter(
+                    x=df['timestamp'],
+                    y=[30] * len(df),
+                    name='Oversold',
+                    line=dict(color='green', width=1, dash='dash'),
+                ),
+                row=3, col=1
+            )
+        
+        # Add Volume
+        colors = ['green' if df['close'].iloc[i] >= df['close'].iloc[i-1] else 'red' 
+                for i in range(1, len(df))]
+        colors.insert(0, 'green')  # Add color for the first bar
+        
         fig.add_trace(
             go.Bar(
                 x=df['timestamp'],
-                y=df['macd_hist'],
-                name='MACD Histogram',
+                y=df['volume'],
+                name='Volume',
                 marker_color=colors
-            ),
-            row=2, col=1
-        )
-    
-    # Add RSI
-    if 'rsi' in df.columns:
-        fig.add_trace(
-            go.Scatter(
-                x=df['timestamp'],
-                y=df['rsi'],
-                name='RSI',
-                line=dict(color='blue', width=1),
-            ),
-            row=3, col=1
-        )
-        
-        # Add RSI overbought/oversold levels
-        fig.add_trace(
-            go.Scatter(
-                x=df['timestamp'],
-                y=[70] * len(df),
-                name='Overbought',
-                line=dict(color='red', width=1, dash='dash'),
-            ),
-            row=3, col=1
-        )
-        
-        fig.add_trace(
-            go.Scatter(
-                x=df['timestamp'],
-                y=[30] * len(df),
-                name='Oversold',
-                line=dict(color='green', width=1, dash='dash'),
-            ),
-            row=3, col=1
-        )
-    
-    # Add Volume
-    colors = ['green' if df['close'].iloc[i] >= df['close'].iloc[i-1] else 'red' 
-              for i in range(1, len(df))]
-    colors.insert(0, 'green')  # Add color for the first bar
-    
-    fig.add_trace(
-        go.Bar(
-            x=df['timestamp'],
-            y=df['volume'],
-            name='Volume',
-            marker_color=colors
-        ),
-        row=4, col=1
-    )
-    
-    # Add OBV if available
-    if 'obv' in df.columns:
-        # Scale OBV to fit with volume for visualization
-        obv_scaled = df['obv'] / df['obv'].abs().max() * df['volume'].max() * 0.7
-        
-        fig.add_trace(
-            go.Scatter(
-                x=df['timestamp'],
-                y=obv_scaled,
-                name='OBV (scaled)',
-                line=dict(color='purple', width=1.5),
             ),
             row=4, col=1
         )
+        
+        # Add OBV if available
+        if 'obv' in df.columns:
+            # Scale OBV to fit with volume for visualization
+            if df['obv'].abs().max() > 0:  # Avoid division by zero
+                obv_scaled = df['obv'] / df['obv'].abs().max() * df['volume'].max() * 0.7
+                
+                fig.add_trace(
+                    go.Scatter(
+                        x=df['timestamp'],
+                        y=obv_scaled,
+                        name='OBV (scaled)',
+                        line=dict(color='purple', width=1.5),
+                    ),
+                    row=4, col=1
+                )
+        
+        # Update layout
+        fig.update_layout(
+            title=f'{symbol} - {timeframe} Timeframe',
+            xaxis_title='Date',
+            yaxis_title='Price',
+            height=900,
+            showlegend=True,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
+            xaxis_rangeslider_visible=False
+        )
+        
+        # Update y-axis labels
+        fig.update_yaxes(title_text="Price", row=1, col=1)
+        fig.update_yaxes(title_text="MACD", row=2, col=1)
+        fig.update_yaxes(title_text="RSI", row=3, col=1)
+        fig.update_yaxes(title_text="Volume", row=4, col=1)
+        
+        return fig
     
-    # Update layout
-    fig.update_layout(
-        title=f'{symbol} - {timeframe} Timeframe',
-        xaxis_title='Date',
-        yaxis_title='Price',
-        height=900,
-        showlegend=True,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
-        xaxis_rangeslider_visible=False
-    )
-    
-    # Update y-axis labels
-    fig.update_yaxes(title_text="Price", row=1, col=1)
-    fig.update_yaxes(title_text="MACD", row=2, col=1)
-    fig.update_yaxes(title_text="RSI", row=3, col=1)
-    fig.update_yaxes(title_text="Volume", row=4, col=1)
-    
-    return fig
+    except Exception as e:
+        st.error(f"Error creating chart: {e}")
+        st.code(traceback.format_exc())
+        return None
 
 # Check if market is open
 def is_market_open():
+    """Check if the US market is currently open"""
     try:
-        clock = api.get_clock()
-        return clock.is_open
+        if api is not None:
+            clock = api.get_clock()
+            return clock.is_open
+        else:
+            # Fallback check if Alpaca API is not available
+            # Check if it's a weekday and between 9:30 AM and 4:00 PM Eastern Time
+            eastern = pytz.timezone('US/Eastern')
+            now = datetime.now(eastern)
+            
+            # Check if it's a weekday (0 = Monday, 4 = Friday)
+            is_weekday = now.weekday() < 5
+            
+            # Check if it's between 9:30 AM and 4:00 PM ET
+            market_open_time = now.replace(hour=9, minute=30, second=0)
+            market_close_time = now.replace(hour=16, minute=0, second=0)
+            
+            is_market_hours = market_open_time <= now <= market_close_time
+            
+            return is_weekday and is_market_hours
     except Exception as e:
-        st.error(f"Error checking market status: {e}")
+        st.warning(f"Error checking market status: {e}")
+        # Default to market closed if we can't determine
         return False
 
 # Get universe of stocks 
 def get_stock_universe():
+    """Get a list of stocks to scan"""
     # Default list for demo purposes
     default_stocks = [
         "AAPL", "MSFT", "AMZN", "GOOGL", "META", 
@@ -578,6 +689,7 @@ def get_stock_universe():
 
 # Scan for signals across multiple stocks
 def scan_for_signals(stocks, timeframe, min_confidence=65):
+    """Scan multiple stocks for trading signals"""
     all_signals = []
     progress_bar = st.progress(0)
     
@@ -596,6 +708,7 @@ def scan_for_signals(stocks, timeframe, min_confidence=65):
             if signal and signal['confidence'] >= min_confidence and signal['direction'] != 'NEUTRAL':
                 signal['symbol'] = symbol
                 signal['timestamp'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                signal['last_price'] = df['close'].iloc[-1]
                 all_signals.append(signal)
         except Exception as e:
             st.error(f"Error processing {symbol}: {e}")
@@ -627,8 +740,8 @@ def show_dashboard():
     symbol = st.sidebar.text_input("Stock Symbol", "AAPL").upper()
     timeframe = st.sidebar.selectbox(
         "Timeframe", 
-        ["1min", "5min", "15min", "1hour", "1day"],
-        index=3  # Default to 1hour
+        ["1day", "1hour", "15min", "5min", "1min"],
+        index=0  # Default to 1day since it's most reliable
     )
     
     # Auto refresh option
@@ -657,14 +770,15 @@ def show_dashboard():
             
             # Plot chart
             fig = plot_chart(data_with_indicators, symbol, timeframe)
-            st.plotly_chart(fig, use_container_width=True)
+            if fig:
+                st.plotly_chart(fig, use_container_width=True)
         else:
             st.error(f"No data available for {symbol} with {timeframe} timeframe")
     
     with col2:
         st.subheader("Signal Analysis")
         
-        if not data.empty:
+        if not data.empty and len(data) >= 30:
             signal = generate_signals(data_with_indicators)
             
             if signal and 'direction' in signal:
@@ -704,7 +818,7 @@ def show_dashboard():
             else:
                 st.info("No clear signals detected")
         else:
-            st.error("Cannot generate signals without data")
+            st.error("Cannot generate signals without sufficient data")
     
     # Auto refresh logic
     if auto_refresh:
@@ -725,11 +839,11 @@ def show_scanner():
         ["Quick Scan (Pre-selected)", "Custom Scan"]
     )
     
-    # Timeframe selection
+    # Timeframe selection - default to daily for reliability
     timeframe = st.sidebar.selectbox(
         "Timeframe", 
-        ["5min", "15min", "1hour", "1day"],
-        index=2  # Default to 1hour
+        ["1day", "1hour", "15min", "5min"],
+        index=0  # Default to 1day
     )
     
     # Minimum confidence threshold
@@ -778,6 +892,10 @@ def show_scanner():
                         ### 🔴 SELL - {signal['symbol']} - {signal['confidence']}% Confidence
                         """)
                     
+                    # Display current price if available
+                    if 'last_price' in signal:
+                        st.write(f"Current Price: ${signal['last_price']:.2f}")
+                    
                     # Display reasons
                     for reason in signal['reasons']:
                         st.write(f"• {reason}")
@@ -802,7 +920,7 @@ def show_documentation():
         
         Our technical analysis system follows this process flow:
         
-        1. **Data Acquisition**: Fetches live market data from Alpaca API
+        1. **Data Acquisition**: Fetches market data from Alpaca API or Yahoo Finance (fallback)
         2. **Indicator Calculation**: Calculates technical indicators on the data
         3. **Signal Generation**: Identifies potential trading signals
         4. **Confidence Scoring**: Assigns confidence scores to signals
@@ -1033,6 +1151,49 @@ def show_documentation():
         
         This system is a tool to identify potential trades with higher probability, not a guaranteed profit system. Always combine with fundamental analysis and proper risk management for best results.
         """)
+    
+    with st.expander("Data Sources"):
+        st.markdown("""
+        ### Data Sources and Fallback Mechanism
+        
+        This system uses multiple data sources to ensure reliability:
+        
+        1. **Primary: Alpaca Markets API**
+           - Used for real-time and historical stock data
+           - Requires API keys and may have limitations on free tier
+        
+        2. **Fallback: Yahoo Finance**
+           - Used automatically if Alpaca data is unavailable
+           - More accessible but may have slightly delayed data
+        
+        The system automatically switches between data sources as needed, ensuring you always have access to market data even if one source is unavailable.
+        """)
+
+# Requirements info
+def show_requirements():
+    st.title("System Requirements")
+    
+    st.markdown("""
+    ### Required Python Packages
+    
+    ```
+    streamlit==1.44.1
+    pandas==2.2.3
+    numpy==2.2.5
+    alpaca-trade-api==3.2.0
+    plotly==6.0.1
+    python-dateutil==2.9.0.post0
+    pytz==2025.2
+    requests==2.32.3
+    yfinance==0.2.25
+    ```
+    
+    ### Installation
+    
+    1. Save the requirements to a file named `requirements.txt`
+    2. Install with: `pip install -r requirements.txt`
+    3. Run the app with: `streamlit run app.py`
+    """)
 
 # Run the app
 if __name__ == "__main__":
