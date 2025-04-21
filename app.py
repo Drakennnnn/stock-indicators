@@ -22,7 +22,7 @@ st.set_page_config(
 
 # Finnhub API credentials
 # Replace with your valid API key
-FINNHUB_API_KEY = "your_finnhub_api_key_here"
+FINNHUB_API_KEY = "d03bkkpr01qvvb93ems0d03bkkpr01qvvb93emsg"
 
 # Initialize Finnhub client
 finnhub_client = finnhub.Client(api_key=FINNHUB_API_KEY)
