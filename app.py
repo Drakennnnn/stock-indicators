@@ -6,7 +6,6 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import time
 from datetime import datetime, timedelta
-import pandas_ta as ta  # Using pandas-ta instead of TA-Lib
 import requests
 import json
 
@@ -58,7 +57,7 @@ def fetch_stock_data(symbol, timeframe, limit=100):
         st.error(f"Error fetching data for {symbol}: {e}")
         return pd.DataFrame()
 
-# Calculate indicators using pandas_ta instead of TA-Lib
+# Custom indicator calculation functions
 def calculate_indicators(df):
     if len(df) < 50:  # Ensure we have enough data
         return df
@@ -66,66 +65,134 @@ def calculate_indicators(df):
     # Make a copy to avoid SettingWithCopyWarning
     df = df.copy()
     
-    # MACD
+    # Calculate EMA values
     try:
-        macd = ta.macd(df['close'], fast=12, slow=26, signal=9)
-        df['macd'] = macd['MACD_12_26_9']
-        df['macd_signal'] = macd['MACDs_12_26_9']
-        df['macd_hist'] = macd['MACDh_12_26_9']
+        df['ema8'] = df['close'].ewm(span=8, adjust=False).mean()
+        df['ema12'] = df['close'].ewm(span=12, adjust=False).mean()
+        df['ema21'] = df['close'].ewm(span=21, adjust=False).mean()
+        df['ema26'] = df['close'].ewm(span=26, adjust=False).mean()
+        df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
+        df['ema200'] = df['close'].ewm(span=200, adjust=False).mean()
+    except Exception as e:
+        st.warning(f"Error calculating EMAs: {e}")
+    
+    # MACD calculation
+    try:
+        # Calculate MACD components
+        df['macd'] = df['ema12'] - df['ema26']
+        df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
+        df['macd_hist'] = df['macd'] - df['macd_signal']
         
         # Add MACD crossover signals
         df['macd_cross_up'] = (df['macd'] > df['macd_signal']) & (df['macd'].shift() <= df['macd_signal'].shift())
         df['macd_cross_down'] = (df['macd'] < df['macd_signal']) & (df['macd'].shift() >= df['macd_signal'].shift())
     except Exception as e:
-        st.warning(f"Not enough data for MACD calculation: {e}")
+        st.warning(f"Error calculating MACD: {e}")
     
-    # RSI
+    # RSI calculation
     try:
-        df['rsi'] = ta.rsi(df['close'], length=14)
+        # Get price changes
+        delta = df['close'].diff()
+        
+        # Separate gains and losses
+        gain = delta.copy()
+        loss = delta.copy()
+        gain[gain < 0] = 0
+        loss[loss > 0] = 0
+        loss = abs(loss)
+        
+        # Calculate average gain and loss over 14 periods
+        avg_gain = gain.rolling(window=14).mean()
+        avg_loss = loss.rolling(window=14).mean()
+        
+        # Calculate RS and RSI
+        rs = avg_gain / avg_loss
+        df['rsi'] = 100 - (100 / (1 + rs))
     except Exception as e:
-        st.warning(f"Not enough data for RSI calculation: {e}")
+        st.warning(f"Error calculating RSI: {e}")
     
     # Bollinger Bands
     try:
-        bbands = ta.bbands(df['close'], length=20, std=2)
-        df['bb_upper'] = bbands['BBU_20_2.0']
-        df['bb_middle'] = bbands['BBM_20_2.0']
-        df['bb_lower'] = bbands['BBL_20_2.0']
+        # Calculate middle band (SMA20)
+        df['bb_middle'] = df['close'].rolling(window=20).mean()
+        
+        # Calculate standard deviation
+        df['bb_std'] = df['close'].rolling(window=20).std()
+        
+        # Calculate upper and lower bands
+        df['bb_upper'] = df['bb_middle'] + (df['bb_std'] * 2)
+        df['bb_lower'] = df['bb_middle'] - (df['bb_std'] * 2)
+        
+        # Calculate Bollinger Band width
         df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['bb_middle']
+        
+        # Calculate %B (where price is in relation to the bands)
         df['bb_pct_b'] = (df['close'] - df['bb_lower']) / (df['bb_upper'] - df['bb_lower'])
     except Exception as e:
-        st.warning(f"Not enough data for Bollinger Bands calculation: {e}")
+        st.warning(f"Error calculating Bollinger Bands: {e}")
     
-    # EMA values
+    # EMA Cloud (bullish when ema8 > ema21)
     try:
-        df['ema8'] = ta.ema(df['close'], length=8)
-        df['ema21'] = ta.ema(df['close'], length=21)
-        df['ema50'] = ta.ema(df['close'], length=50)
-        df['ema200'] = ta.ema(df['close'], length=200)
-        
-        # EMA Cloud (bullish when ema8 > ema21)
         df['ema_cloud_bullish'] = df['ema8'] > df['ema21']
         df['ema_trend'] = df['ema50'] > df['ema200']
     except Exception as e:
-        st.warning(f"Not enough data for EMA calculation: {e}")
+        st.warning(f"Error calculating EMA Cloud: {e}")
     
     # Volume analysis
     try:
+        # Volume moving average
         df['volume_sma20'] = df['volume'].rolling(window=20).mean()
-        df['volume_z_score'] = (df['volume'] - df['volume_sma20']) / df['volume'].rolling(window=20).std()
         
-        # On Balance Volume
-        df['obv'] = ta.obv(df['close'], df['volume'])
+        # Volume Z-score
+        df['volume_std'] = df['volume'].rolling(window=20).std()
+        df['volume_z_score'] = (df['volume'] - df['volume_sma20']) / df['volume_std']
+        
+        # On Balance Volume (OBV)
+        obv = pd.Series(index=df.index)
+        obv.iloc[0] = 0
+        
+        for i in range(1, len(df)):
+            if df['close'].iloc[i] > df['close'].iloc[i-1]:
+                obv.iloc[i] = obv.iloc[i-1] + df['volume'].iloc[i]
+            elif df['close'].iloc[i] < df['close'].iloc[i-1]:
+                obv.iloc[i] = obv.iloc[i-1] - df['volume'].iloc[i]
+            else:
+                obv.iloc[i] = obv.iloc[i-1]
+        
+        df['obv'] = obv
         df['obv_sma'] = df['obv'].rolling(window=20).mean()
     except Exception as e:
-        st.warning(f"Not enough data for volume analysis: {e}")
+        st.warning(f"Error calculating volume metrics: {e}")
     
-    # ADX (Average Directional Index) for trend strength
+    # ADX calculation is more complex, so we'll use a simplified version
     try:
-        adx = ta.adx(df['high'], df['low'], df['close'], length=14)
-        df['adx'] = adx['ADX_14']
+        # True Range
+        df['tr1'] = abs(df['high'] - df['low'])
+        df['tr2'] = abs(df['high'] - df['close'].shift())
+        df['tr3'] = abs(df['low'] - df['close'].shift())
+        df['tr'] = df[['tr1', 'tr2', 'tr3']].max(axis=1)
+        
+        # +DM and -DM
+        df['high_diff'] = df['high'] - df['high'].shift()
+        df['low_diff'] = df['low'].shift() - df['low']
+        
+        df['plus_dm'] = ((df['high_diff'] > df['low_diff']) & (df['high_diff'] > 0)) * df['high_diff']
+        df['minus_dm'] = ((df['low_diff'] > df['high_diff']) & (df['low_diff'] > 0)) * df['low_diff']
+        
+        # Smoothed +DM, -DM and TR
+        smooth_period = 14
+        
+        # Simple moving average of +DM, -DM and TR
+        df['plus_di'] = 100 * df['plus_dm'].rolling(window=smooth_period).mean() / df['tr'].rolling(window=smooth_period).mean()
+        df['minus_di'] = 100 * df['minus_dm'].rolling(window=smooth_period).mean() / df['tr'].rolling(window=smooth_period).mean()
+        
+        # Calculate DX
+        df['dx'] = 100 * abs(df['plus_di'] - df['minus_di']) / (df['plus_di'] + df['minus_di'])
+        
+        # Calculate ADX
+        df['adx'] = df['dx'].rolling(window=smooth_period).mean()
     except Exception as e:
-        st.warning(f"Not enough data for ADX calculation: {e}")
+        st.warning(f"Error calculating ADX: {e}")
     
     return df
 
@@ -216,13 +283,15 @@ def generate_signals(df):
             confidence_score += 10
         
         # Bollinger Band squeeze (setup for volatility breakout)
-        if df['bb_width'].iloc[last_idx] < df['bb_width'].rolling(window=20).mean().iloc[last_idx] * 0.8:
-            signals.append({
-                'type': 'NEUTRAL',
-                'reason': 'Bollinger Band Squeeze (potential breakout setup)',
-                'points': 5
-            })
-            confidence_score += 5
+        if 'bb_width' in df.columns:
+            bb_mean = df['bb_width'].rolling(window=20).mean().iloc[last_idx]
+            if df['bb_width'].iloc[last_idx] < bb_mean * 0.8:
+                signals.append({
+                    'type': 'NEUTRAL',
+                    'reason': 'Bollinger Band Squeeze (potential breakout setup)',
+                    'points': 5
+                })
+                confidence_score += 5
     
     # Volume confirmation
     if 'volume_z_score' in df.columns:
@@ -751,7 +820,7 @@ def show_documentation():
         **What it is**: The MACD is a trend-following momentum indicator that shows the relationship between two moving averages of a security's price.
         
         **How it's calculated**: 
-        - MACD Line = 12-period EMA -26-period EMA
+        - MACD Line = 12-period EMA - 26-period EMA
         - Signal Line = 9-period EMA of MACD Line
         - Histogram = MACD Line - Signal Line
         
