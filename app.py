@@ -4,6 +4,7 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import finnhub
+import requests
 import time
 from datetime import datetime, timedelta
 import pytz
@@ -20,38 +21,20 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Finnhub API credentials
-# Replace with your valid API key
-FINNHUB_API_KEY = "d03bkkpr01qvvb93ems0d03bkkpr01qvvb93emsg"
+# API keys
+FINNHUB_API_KEY = "d03bkkpr01qvvb93ems0d03bkkpr01qvvb93emsg"  # For real-time data
+ALPHA_VANTAGE_API_KEY = "0I7EULOLI2DW2UPW"  # For historical data
 
-# Initialize Finnhub client
+# Initialize Finnhub client for real-time data
 finnhub_client = finnhub.Client(api_key=FINNHUB_API_KEY)
 
 # Message queue for websocket data
 ws_message_queue = queue.Queue()
 
-# Default resolution set to daily ('D') for all analysis
-# Daily resolution works best for swing trading (3-10 day holds)
-DEFAULT_RESOLUTION = 'D'
-DEFAULT_LOOKBACK_DAYS = 90  # 90 days gives enough data for all our indicators
+# Default settings
+DEFAULT_LOOKBACK_DAYS = 100  # Lookback period for historical data
 
-# API key verification function
-def verify_api_key():
-    try:
-        # Try a simple API call to verify the key
-        response = finnhub_client.quote('AAPL')
-        if 'c' in response:
-            st.sidebar.success("✅ Finnhub API connected successfully")
-            return True
-        else:
-            st.sidebar.error("❌ Finnhub API returned unexpected response")
-            return False
-    except Exception as e:
-        st.sidebar.error(f"❌ Finnhub API connection failed: {e}")
-        st.sidebar.info("Please check your API key in the code")
-        return False
-
-# Initialize websocket connection
+# Initialize websocket connection for real-time data
 def init_websocket():
     def on_message(ws, message):
         data = json.loads(message)
@@ -87,55 +70,93 @@ def init_websocket():
     
     return ws
 
-# Cache function for data fetching to avoid repeated API calls
-@st.cache_data(ttl=300)  # Cache data for 5 minutes
-def fetch_stock_data(symbol, days_back=DEFAULT_LOOKBACK_DAYS):
+# Function to test API keys
+def verify_api_keys():
+    av_valid = False
+    fh_valid = False
+    
+    # Test Alpha Vantage API key
     try:
-        # Calculate time range
-        end_time = int(datetime.now().timestamp())
-        start_time = int((datetime.now() - timedelta(days=days_back)).timestamp())
-        
-        # Small delay to avoid rate limiting
-        time.sleep(0.1)
-        
-        # Fetch candle data with daily resolution
-        candles = finnhub_client.stock_candles(
-            symbol, 
-            DEFAULT_RESOLUTION, 
-            start_time, 
-            end_time
-        )
-        
-        if candles['s'] == 'ok':
-            # Convert to DataFrame
-            df = pd.DataFrame({
-                'timestamp': pd.to_datetime([datetime.fromtimestamp(t) for t in candles['t']]),
-                'open': candles['o'],
-                'high': candles['h'],
-                'low': candles['l'],
-                'close': candles['c'],
-                'volume': candles['v']
-            })
-            
-            return df
+        url = f'https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=AAPL&apikey={ALPHA_VANTAGE_API_KEY}'
+        response = requests.get(url)
+        data = response.json()
+        if "Global Quote" in data:
+            st.sidebar.success("✅ Alpha Vantage API connected successfully")
+            av_valid = True
         else:
-            st.warning(f"No data returned for {symbol}. Response: {candles['s']}")
-            return pd.DataFrame()
-            
+            st.sidebar.error("❌ Alpha Vantage API returned unexpected response")
     except Exception as e:
-        if "You don't have access to this resource" in str(e):
-            st.error(f"API access error for {symbol}: Please check your API key and subscription level")
-        elif "API limit reached" in str(e):
-            st.warning(f"API rate limit reached. Adding delay for {symbol}")
-            time.sleep(2)  # Add longer delay when hitting rate limits
-            return fetch_stock_data(symbol, days_back)  # Retry
+        st.sidebar.error(f"❌ Alpha Vantage API connection failed: {e}")
+
+    # Test Finnhub API key
+    try:
+        quote = finnhub_client.quote('AAPL')
+        if 'c' in quote:
+            st.sidebar.success("✅ Finnhub API connected successfully")
+            fh_valid = True
         else:
-            st.error(f"Error fetching data for {symbol}: {e}")
+            st.sidebar.error("❌ Finnhub API returned unexpected response")
+    except Exception as e:
+        st.sidebar.error(f"❌ Finnhub API connection failed: {e}")
+    
+    return av_valid, fh_valid
+
+# Function to fetch historical data from Alpha Vantage
+@st.cache_data(ttl=3600)  # Cache data for 1 hour
+def fetch_alpha_vantage_daily(symbol, days_back=DEFAULT_LOOKBACK_DAYS):
+    try:
+        # Alpha Vantage API call for daily data
+        url = f'https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol={symbol}&outputsize=full&apikey={ALPHA_VANTAGE_API_KEY}'
+        response = requests.get(url)
+        data = response.json()
+        
+        if "Time Series (Daily)" not in data:
+            st.warning(f"No data found for {symbol} in Alpha Vantage. Error: {data.get('Information', 'Unknown error')}")
+            return pd.DataFrame()
+        
+        # Convert to DataFrame
+        df = pd.DataFrame(data["Time Series (Daily)"]).T
+        df = df.rename(columns={
+            '1. open': 'open',
+            '2. high': 'high',
+            '3. low': 'low',
+            '4. close': 'close',
+            '5. volume': 'volume'
+        })
+        
+        # Convert columns to numeric values
+        for col in df.columns:
+            df[col] = pd.to_numeric(df[col])
+        
+        # Add datetime index
+        df.index = pd.to_datetime(df.index)
+        df = df.sort_index()
+        
+        # Keep only the required days
+        if days_back and len(df) > days_back:
+            df = df.iloc[-days_back:]
+        
+        # Reset index and rename it to 'timestamp' to maintain compatibility with original code
+        df = df.reset_index().rename(columns={'index': 'timestamp'})
+        
+        return df
+        
+    except Exception as e:
+        st.error(f"Error fetching data for {symbol} from Alpha Vantage: {e}")
         return pd.DataFrame()
+
+# Function to get current quote from Finnhub (real-time)
+def get_current_quote(symbol):
+    try:
+        quote = finnhub_client.quote(symbol)
+        return quote
+    except Exception as e:
+        st.warning(f"Error fetching current quote for {symbol}: {e}")
+        return None
 
 # Calculate all technical indicators
 def calculate_indicators(df):
-    if len(df) < 30:  # Ensure we have enough data
+    if df.empty or len(df) < 30:  # Ensure we have enough data
         st.warning("Not enough data for reliable indicator calculation")
         return df
     
@@ -726,7 +747,7 @@ def plot_chart(df, symbol):
         # Update layout
         fig.update_layout(
             title=f'{symbol} - Daily Chart',
-            xaxis_title='Date', 
+            xaxis_title='Date',
             yaxis_title='Price',
             height=900,
             showlegend=True,
@@ -770,11 +791,11 @@ def scan_for_signals(stocks, min_confidence=65):
             # Update progress
             progress_bar.progress((i + 1) / len(stocks))
             
-            # Add a small delay to avoid hitting API rate limits (30 calls/sec for Finnhub)
-            if i > 0 and i % 25 == 0:
-                time.sleep(1)
+            # Add a small delay to avoid hitting API rate limits
+            if i > 0 and i % 5 == 0:  # Alpha Vantage limit is 5 calls per minute for free tier
+                time.sleep(12)  # Wait 12 seconds between every 5 calls
             
-            df = fetch_stock_data(symbol)
+            df = fetch_alpha_vantage_daily(symbol)
             if df.empty:
                 continue
                 
@@ -835,12 +856,15 @@ def setup_real_time_monitoring(symbols):
 
 # App navigation
 def main():
-    # First check API key
-    if not verify_api_key():
-        st.error("Please replace the API key in the code with a valid Finnhub API key")
-        st.info("Sign up for a free API key at https://finnhub.io/")
-        return
-
+    # First check API keys
+    av_valid, fh_valid = verify_api_keys()
+    
+    if not av_valid:
+        st.error("Alpha Vantage API key is invalid or has reached its limit. Historical data will not be available.")
+    
+    if not fh_valid:
+        st.warning("Finnhub API key is invalid or has reached its limit. Real-time data may not be available.")
+    
     # Custom CSS for better styling
     st.markdown("""
     <style>
@@ -869,12 +893,28 @@ def main():
         border-radius: 5px;
         margin-top: 10px;
     }
+    .api-info {
+        background-color: #e7f3fe;
+        padding: 10px;
+        border-radius: 5px;
+        margin-top: 10px;
+        border-left: 5px solid #2196F3;
+    }
     </style>
     """, unsafe_allow_html=True)
     
     # Sidebar navigation
     st.sidebar.title("Navigation")
     page = st.sidebar.radio("Go to", ["Dashboard", "Stock Scanner", "Real-time Monitor", "Documentation"])
+    
+    # Display note about APIs
+    st.sidebar.markdown("""
+    <div class="api-info">
+    <strong>Data Sources:</strong><br>
+    - Historical data: Alpha Vantage<br>
+    - Real-time data: Finnhub
+    </div>
+    """, unsafe_allow_html=True)
     
     if page == "Dashboard":
         show_dashboard()
@@ -899,22 +939,22 @@ def show_dashboard():
         index=0  # Default to AAPL
     )
     
+    # Days to look back
+    lookback_days = st.sidebar.slider("Days to Analyze", 50, 500, 100)
+    
     # Auto refresh option
     auto_refresh = st.sidebar.checkbox("Auto Refresh Data", value=False)
-    refresh_interval = st.sidebar.slider("Refresh Interval (seconds)", 30, 300, 60)
+    refresh_interval = st.sidebar.slider("Refresh Interval (minutes)", 1, 60, 15)
     
     # Last price info
-    try:
-        last_price = finnhub_client.quote(symbol)
-        if 'c' in last_price:
-            st.sidebar.success(f"Last Price: ${last_price['c']:.2f}")
-            if 'pc' in last_price:
-                change = last_price['c'] - last_price['pc']
-                change_pct = (change / last_price['pc']) * 100
-                color = "green" if change >= 0 else "red"
-                st.sidebar.markdown(f"<p style='color:{color}'>Change: {change:.2f} ({change_pct:.2f}%)</p>", unsafe_allow_html=True)
-    except:
-        st.sidebar.warning("Unable to fetch latest price")
+    quote = get_current_quote(symbol)
+    if quote and 'c' in quote:
+        st.sidebar.success(f"Last Price: ${quote['c']:.2f}")
+        if 'pc' in quote:
+            change = quote['c'] - quote['pc']
+            change_pct = (change / quote['pc']) * 100
+            color = "green" if change >= 0 else "red"
+            st.sidebar.markdown(f"<p style='color:{color}'>Change: {change:.2f} ({change_pct:.2f}%)</p>", unsafe_allow_html=True)
     
     # Main content area
     col1, col2 = st.columns([2, 1])
@@ -922,7 +962,7 @@ def show_dashboard():
     with col1:
         # Get data and calculate indicators
         with st.spinner("Fetching data..."):
-            data = fetch_stock_data(symbol)
+            data = fetch_alpha_vantage_daily(symbol, lookback_days)
         
         if not data.empty:
             with st.spinner("Calculating indicators..."):
@@ -983,7 +1023,7 @@ def show_dashboard():
                 st.write(f"Low: ${latest['low']:.2f}")
                 st.write(f"Close: ${latest['close']:.2f}")
                 st.write(f"Volume: {int(latest['volume']):,}")
-                st.write(f"Time: {latest['timestamp']}")
+                st.write(f"Date: {latest['timestamp'].strftime('%Y-%m-%d')}")
                 
                 # Display key indicator values
                 st.subheader("Key Indicators:")
@@ -1017,9 +1057,9 @@ def show_dashboard():
     
     # Auto refresh logic
     if auto_refresh:
-        st.write(f"Page will refresh in {refresh_interval} seconds")
-        time.sleep(refresh_interval)
-        st.rerun()  # Using rerun() instead of experimental_rerun()
+        st.write(f"Page will refresh in {refresh_interval} minutes")
+        time.sleep(refresh_interval * 60)
+        st.rerun()
 
 # Scanner page
 def show_scanner():
@@ -1050,8 +1090,9 @@ def show_scanner():
     stocks_to_scan = []
     
     if scan_mode == "Quick Scan (Pre-selected)":
-        stocks_to_scan = get_us_stock_universe()
+        stocks_to_scan = get_us_stock_universe()[:10]  # Limit to 10 stocks to avoid API limits
         st.write(f"Scanning {len(stocks_to_scan)} US stocks...")
+        st.warning("Alpha Vantage free tier limits: 5 API calls per minute, 500 calls per day. Scanning may take some time.")
     else:
         # Custom stock input
         custom_input = st.sidebar.text_area(
@@ -1069,7 +1110,7 @@ def show_scanner():
     
     # Scan button
     if st.button("Run Scan"):
-        with st.spinner("Scanning for signals..."):
+        with st.spinner("Scanning for signals... (This may take a few minutes due to API rate limits)"):
             signals = scan_for_signals(stocks_to_scan, min_confidence)
             
             # Filter by direction if needed
@@ -1168,11 +1209,9 @@ def show_real_time_monitor():
     quotes_data = []
     for symbol in monitoring_symbols:
         try:
-            # Add a small delay to avoid API rate limits
-            time.sleep(0.1)
-            
-            quote = finnhub_client.quote(symbol)
-            if 'c' in quote:
+            # Get quote data
+            quote = get_current_quote(symbol)
+            if quote and 'c' in quote:
                 change = quote['c'] - quote['pc']
                 change_pct = (change / quote['pc']) * 100
                 
@@ -1214,7 +1253,7 @@ def show_real_time_monitor():
     auto_refresh = st.checkbox("Auto-refresh quotes", value=True)
     if auto_refresh:
         time.sleep(5)  # Refresh every 5 seconds
-        st.rerun()  # Using rerun() instead of experimental_rerun()
+        st.rerun()
 
 # Documentation page
 def show_documentation():
@@ -1224,22 +1263,22 @@ def show_documentation():
     This dashboard analyzes stocks using technical indicators to generate trading signals with confidence scores and recommended timeframes.
     """)
     
-    with st.expander("System Overview", expanded=True):
+    with st.expander("📋 System Overview", expanded=True):
         st.markdown("""
         ### System Architecture
         
-        Our technical analysis system follows this process flow:
+        Our technical analysis system uses a hybrid data approach:
         
-        1. **Data Acquisition**: Fetches market data from Finnhub API with daily resolution
-        2. **Indicator Calculation**: Calculates technical indicators on the data
-        3. **Signal Generation**: Identifies potential trading signals
-        4. **Confidence Scoring**: Assigns confidence scores to signals
-        5. **Timeframe Analysis**: Determines appropriate holding periods for trades
+        1. **Historical Data**: From Alpha Vantage API (free tier, 5 calls/minute)
+        2. **Real-time Data**: From Finnhub API (websocket for live trades)
+        3. **Technical Analysis**: 8 key indicators to generate signals
+        4. **Signal Confidence**: Weighted scoring system (50-95%)
+        5. **Timeframe Analysis**: Categorizes optimal holding periods
         
-        The system uses a point-based scoring system, with trades requiring a minimum 65% confidence score to be displayed.
+        The system requires a minimum 65% confidence score to display trading signals.
         """)
     
-    with st.expander("Trading Timeframes"):
+    with st.expander("⏱️ Trading Timeframes"):
         st.markdown("""
         ### Signal Timeframes
         
@@ -1255,7 +1294,7 @@ def show_documentation():
         The overall timeframe recommendation is based on the strongest signals present.
         """)
     
-    with st.expander("Core Indicators"):
+    with st.expander("📊 Core Indicators"):
         st.markdown("""
         ### Primary Indicators
         
@@ -1308,7 +1347,7 @@ def show_documentation():
         **Optimal timeframe**: Long-term (1-3 months)
         """)
     
-    with st.expander("Signal Generation System"):
+    with st.expander("🔢 Signal Generation System"):
         st.markdown("""
         ### Confidence Score Calculation
         
@@ -1336,7 +1375,28 @@ def show_documentation():
         The recommended timeframe is determined by the strongest contributing signals.
         """)
     
-    with st.expander("Best Practices for Trading"):
+    with st.expander("📘 API Usage Information"):
+        st.markdown("""
+        ### API Limitations & Best Practices
+        
+        #### Alpha Vantage (Historical Data)
+        - Free tier limit: 5 API calls per minute, 500 per day
+        - Used for: Historical price data, daily OHLC data
+        - Premium tier available for higher limits
+        
+        #### Finnhub (Real-time Data)
+        - Free tier includes: Websocket access for real-time trades
+        - Used for: Real-time trade monitoring, current quotes
+        - Premium tier required for historical OHLCV data
+        
+        #### Best Practices
+        - Limit scanning to 5-10 stocks at a time
+        - Allow 60 seconds between scans to respect API limits
+        - Use the dashboard for detailed analysis of individual stocks
+        - Use scanner sparingly to find potential opportunities
+        """)
+    
+    with st.expander("🏆 Best Practices for Trading"):
         st.markdown("""
         ### How to Use This System Effectively
         
