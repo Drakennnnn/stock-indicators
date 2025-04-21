@@ -21,13 +21,35 @@ st.set_page_config(
 )
 
 # Finnhub API credentials
-FINNHUB_API_KEY = "d03bkkpr01qvvb93ems0d03bkkpr01qvvb93emsg"
+# Replace with your valid API key
+FINNHUB_API_KEY = "your_finnhub_api_key_here"
 
 # Initialize Finnhub client
 finnhub_client = finnhub.Client(api_key=FINNHUB_API_KEY)
 
 # Message queue for websocket data
 ws_message_queue = queue.Queue()
+
+# Default resolution set to daily ('D') for all analysis
+# Daily resolution works best for swing trading (3-10 day holds)
+DEFAULT_RESOLUTION = 'D'
+DEFAULT_LOOKBACK_DAYS = 90  # 90 days gives enough data for all our indicators
+
+# API key verification function
+def verify_api_key():
+    try:
+        # Try a simple API call to verify the key
+        response = finnhub_client.quote('AAPL')
+        if 'c' in response:
+            st.sidebar.success("✅ Finnhub API connected successfully")
+            return True
+        else:
+            st.sidebar.error("❌ Finnhub API returned unexpected response")
+            return False
+    except Exception as e:
+        st.sidebar.error(f"❌ Finnhub API connection failed: {e}")
+        st.sidebar.info("Please check your API key in the code")
+        return False
 
 # Initialize websocket connection
 def init_websocket():
@@ -66,17 +88,20 @@ def init_websocket():
     return ws
 
 # Cache function for data fetching to avoid repeated API calls
-@st.cache_data(ttl=60)  # Cache data for 60 seconds
-def fetch_stock_data(symbol, resolution, days_back=30):
+@st.cache_data(ttl=300)  # Cache data for 5 minutes
+def fetch_stock_data(symbol, days_back=DEFAULT_LOOKBACK_DAYS):
     try:
         # Calculate time range
         end_time = int(datetime.now().timestamp())
         start_time = int((datetime.now() - timedelta(days=days_back)).timestamp())
         
-        # Fetch candle data
+        # Small delay to avoid rate limiting
+        time.sleep(0.1)
+        
+        # Fetch candle data with daily resolution
         candles = finnhub_client.stock_candles(
             symbol, 
-            resolution, 
+            DEFAULT_RESOLUTION, 
             start_time, 
             end_time
         )
@@ -94,10 +119,18 @@ def fetch_stock_data(symbol, resolution, days_back=30):
             
             return df
         else:
+            st.warning(f"No data returned for {symbol}. Response: {candles['s']}")
             return pd.DataFrame()
             
     except Exception as e:
-        st.error(f"Error fetching data for {symbol}: {e}")
+        if "You don't have access to this resource" in str(e):
+            st.error(f"API access error for {symbol}: Please check your API key and subscription level")
+        elif "API limit reached" in str(e):
+            st.warning(f"API rate limit reached. Adding delay for {symbol}")
+            time.sleep(2)  # Add longer delay when hitting rate limits
+            return fetch_stock_data(symbol, days_back)  # Retry
+        else:
+            st.error(f"Error fetching data for {symbol}: {e}")
         return pd.DataFrame()
 
 # Calculate all technical indicators
@@ -290,7 +323,8 @@ def generate_signals(df):
                 signals.append({
                     'type': 'BUY',
                     'reason': 'MACD Bullish Crossover',
-                    'points': 15
+                    'points': 15,
+                    'timeframe': 'Medium-term (2-4 weeks)'
                 })
                 confidence_score += 15
             
@@ -299,7 +333,8 @@ def generate_signals(df):
                 signals.append({
                     'type': 'SELL',
                     'reason': 'MACD Bearish Crossover',
-                    'points': 15
+                    'points': 15,
+                    'timeframe': 'Medium-term (2-4 weeks)'
                 })
                 confidence_score += 15
         
@@ -309,14 +344,35 @@ def generate_signals(df):
                 signals.append({
                     'type': 'BUY',
                     'reason': 'EMA Cloud Bullish (EMA8 > EMA21)',
-                    'points': 10
+                    'points': 10,
+                    'timeframe': 'Short-term (1-2 weeks)'
                 })
                 confidence_score += 10
             else:
                 signals.append({
                     'type': 'SELL',
                     'reason': 'EMA Cloud Bearish (EMA8 < EMA21)',
-                    'points': 10
+                    'points': 10,
+                    'timeframe': 'Short-term (1-2 weeks)'
+                })
+                confidence_score += 10
+        
+        # EMA50 vs EMA200 (Golden/Death Cross)
+        if 'ema_trend' in df.columns:
+            if df['ema_trend'].iloc[last_idx]:
+                signals.append({
+                    'type': 'BUY',
+                    'reason': 'Long-term Bullish Trend (EMA50 > EMA200)',
+                    'points': 10,
+                    'timeframe': 'Long-term (1-3 months)'
+                })
+                confidence_score += 10
+            else:
+                signals.append({
+                    'type': 'SELL',
+                    'reason': 'Long-term Bearish Trend (EMA50 < EMA200)',
+                    'points': 10,
+                    'timeframe': 'Long-term (1-3 months)'
                 })
                 confidence_score += 10
         
@@ -327,7 +383,8 @@ def generate_signals(df):
                 signals.append({
                     'type': 'BUY',
                     'reason': 'RSI Oversold (<30)',
-                    'points': 10
+                    'points': 10,
+                    'timeframe': 'Short-term (3-5 days)'
                 })
                 confidence_score += 10
             # Overbought
@@ -335,7 +392,8 @@ def generate_signals(df):
                 signals.append({
                     'type': 'SELL',
                     'reason': 'RSI Overbought (>70)',
-                    'points': 10
+                    'points': 10,
+                    'timeframe': 'Short-term (3-5 days)'
                 })
                 confidence_score += 10
         
@@ -346,7 +404,8 @@ def generate_signals(df):
                 signals.append({
                     'type': 'BUY',
                     'reason': 'Stochastic RSI Oversold (<20)',
-                    'points': 5
+                    'points': 5,
+                    'timeframe': 'Very Short-term (1-3 days)'
                 })
                 confidence_score += 5
             # Overbought
@@ -354,7 +413,8 @@ def generate_signals(df):
                 signals.append({
                     'type': 'SELL',
                     'reason': 'Stochastic RSI Overbought (>80)',
-                    'points': 5
+                    'points': 5,
+                    'timeframe': 'Very Short-term (1-3 days)'
                 })
                 confidence_score += 5
             
@@ -363,14 +423,16 @@ def generate_signals(df):
                 signals.append({
                     'type': 'BUY',
                     'reason': 'Stochastic RSI Bullish Crossover',
-                    'points': 5
+                    'points': 5,
+                    'timeframe': 'Very Short-term (1-3 days)'
                 })
                 confidence_score += 5
             elif df['stoch_rsi_k'].iloc[last_idx] < df['stoch_rsi_d'].iloc[last_idx] and df['stoch_rsi_k'].iloc[last_idx-1] >= df['stoch_rsi_d'].iloc[last_idx-1]:
                 signals.append({
                     'type': 'SELL',
                     'reason': 'Stochastic RSI Bearish Crossover',
-                    'points': 5
+                    'points': 5,
+                    'timeframe': 'Very Short-term (1-3 days)'
                 })
                 confidence_score += 5
         
@@ -381,7 +443,8 @@ def generate_signals(df):
                 signals.append({
                     'type': 'SELL',
                     'reason': 'Price near upper Bollinger Band',
-                    'points': 10
+                    'points': 10,
+                    'timeframe': 'Short-term (3-7 days)'
                 })
                 confidence_score += 10
             # Price near lower band
@@ -389,7 +452,8 @@ def generate_signals(df):
                 signals.append({
                     'type': 'BUY',
                     'reason': 'Price near lower Bollinger Band',
-                    'points': 10
+                    'points': 10,
+                    'timeframe': 'Short-term (3-7 days)'
                 })
                 confidence_score += 10
             
@@ -398,7 +462,8 @@ def generate_signals(df):
                 signals.append({
                     'type': 'NEUTRAL',
                     'reason': 'Bollinger Band Squeeze (potential breakout setup)',
-                    'points': 5
+                    'points': 5,
+                    'timeframe': 'Short-term (watch for breakout)'
                 })
                 confidence_score += 5
         
@@ -410,7 +475,8 @@ def generate_signals(df):
                 signals.append({
                     'type': direction,
                     'reason': 'High Volume Confirmation',
-                    'points': 10
+                    'points': 10,
+                    'timeframe': 'Enhances existing signals'
                 })
                 confidence_score += 10
         
@@ -420,7 +486,8 @@ def generate_signals(df):
                 signals.append({
                     'type': 'NEUTRAL',
                     'reason': 'Strong Trend (ADX > 25)',
-                    'points': 10
+                    'points': 10,
+                    'timeframe': 'Confirms directional signals'
                 })
                 confidence_score += 10
         
@@ -431,27 +498,44 @@ def generate_signals(df):
         # Calculate final confidence (cap at 95)
         final_confidence = min(95, confidence_score)
         
+        # Determine overall timeframe recommendation
+        all_timeframes = [s['timeframe'] for s in signals if 'timeframe' in s]
+        if not all_timeframes:
+            recommended_timeframe = "Medium-term (1-2 weeks)"
+        else:
+            if "Long-term" in " ".join(all_timeframes):
+                recommended_timeframe = "Long-term (1-3 months)"
+            elif "Medium-term" in " ".join(all_timeframes):
+                recommended_timeframe = "Medium-term (2-4 weeks)"
+            elif "Short-term" in " ".join(all_timeframes):
+                recommended_timeframe = "Short-term (3-10 days)"
+            else:
+                recommended_timeframe = "Very Short-term (1-3 days)"
+        
         # Determine overall signal
         if buy_points > sell_points and final_confidence >= 65:
             overall_signal = {
                 'direction': 'BUY',
                 'confidence': final_confidence,
                 'signals': signals,
-                'reasons': [s['reason'] for s in signals if s['type'] == 'BUY' or s['type'] == 'NEUTRAL']
+                'reasons': [s['reason'] for s in signals if s['type'] == 'BUY' or s['type'] == 'NEUTRAL'],
+                'timeframe': recommended_timeframe
             }
         elif sell_points > buy_points and final_confidence >= 65:
             overall_signal = {
                 'direction': 'SELL',
                 'confidence': final_confidence,
                 'signals': signals,
-                'reasons': [s['reason'] for s in signals if s['type'] == 'SELL' or s['type'] == 'NEUTRAL']
+                'reasons': [s['reason'] for s in signals if s['type'] == 'SELL' or s['type'] == 'NEUTRAL'],
+                'timeframe': recommended_timeframe
             }
         else:
             overall_signal = {
                 'direction': 'NEUTRAL',
                 'confidence': final_confidence,
                 'signals': signals,
-                'reasons': [s['reason'] for s in signals if s['type'] == 'NEUTRAL']
+                'reasons': [s['reason'] for s in signals if s['type'] == 'NEUTRAL'],
+                'timeframe': "Wait for clearer signals"
             }
         
         return overall_signal
@@ -461,7 +545,7 @@ def generate_signals(df):
         return None
 
 # Plot chart with indicators
-def plot_chart(df, symbol, resolution):
+def plot_chart(df, symbol):
     if df.empty or len(df) < 20:
         st.error("Not enough data to plot chart")
         return None
@@ -641,8 +725,8 @@ def plot_chart(df, symbol, resolution):
         
         # Update layout
         fig.update_layout(
-            title=f'{symbol} - {resolution} Resolution',
-            xaxis_title='Date',
+            title=f'{symbol} - Daily Chart',
+            xaxis_title='Date', 
             yaxis_title='Price',
             height=900,
             showlegend=True,
@@ -662,25 +746,22 @@ def plot_chart(df, symbol, resolution):
         st.error(f"Error creating chart: {e}")
         return None
 
-# Get available symbols
-def get_stock_universe():
+# Get available US stock symbols
+def get_us_stock_universe():
     # Default list of US stocks
     default_stocks = [
         "AAPL", "MSFT", "AMZN", "GOOGL", "META", 
         "TSLA", "NVDA", "JPM", "BAC", "V", 
-        "JNJ", "PG", "UNH", "HD", "XOM"
+        "JNJ", "PG", "UNH", "HD", "XOM",
+        "DIS", "NFLX", "INTC", "AMD", "PYPL",
+        "CSCO", "VZ", "T", "CMCSA", "KO",
+        "PEP", "WMT", "MCD", "NKE", "SBUX"
     ]
     
-    # Default list of Indian stocks
-    india_stocks = [
-        "RELIANCE.BO", "TCS.BO", "HDFCBANK.BO", "INFY.BO", "ICICIBANK.BO",
-        "HINDUNILVR.BO", "SBIN.BO", "BHARTIARTL.BO", "BAJFINANCE.BO", "KOTAKBANK.BO"
-    ]
-    
-    return default_stocks + india_stocks
+    return default_stocks
 
 # Scan for signals across multiple stocks
-def scan_for_signals(stocks, resolution, min_confidence=65):
+def scan_for_signals(stocks, min_confidence=65):
     all_signals = []
     progress_bar = st.progress(0)
     
@@ -693,7 +774,7 @@ def scan_for_signals(stocks, resolution, min_confidence=65):
             if i > 0 and i % 25 == 0:
                 time.sleep(1)
             
-            df = fetch_stock_data(symbol, resolution)
+            df = fetch_stock_data(symbol)
             if df.empty:
                 continue
                 
@@ -754,6 +835,12 @@ def setup_real_time_monitoring(symbols):
 
 # App navigation
 def main():
+    # First check API key
+    if not verify_api_key():
+        st.error("Please replace the API key in the code with a valid Finnhub API key")
+        st.info("Sign up for a free API key at https://finnhub.io/")
+        return
+
     # Custom CSS for better styling
     st.markdown("""
     <style>
@@ -775,6 +862,12 @@ def main():
     .neutral-signal {
         color: orange;
         font-weight: bold;
+    }
+    .timeframe-info {
+        background-color: #f0f0f0;
+        padding: 10px;
+        border-radius: 5px;
+        margin-top: 10px;
     }
     </style>
     """, unsafe_allow_html=True)
@@ -799,41 +892,12 @@ def show_dashboard():
     # Settings in sidebar
     st.sidebar.header("Dashboard Settings")
     
-    # Region selection
-    region = st.sidebar.selectbox(
-        "Market Region", 
-        ["US", "India"],
-        index=0
+    # Stock selection 
+    symbol = st.sidebar.selectbox(
+        "Stock Symbol", 
+        get_us_stock_universe(),
+        index=0  # Default to AAPL
     )
-    
-    # Stock selection based on region
-    if region == "US":
-        default_symbol = "AAPL"
-        symbol_suffix = ""
-    else:  # India
-        default_symbol = "RELIANCE"
-        symbol_suffix = ".BO"
-    
-    symbol = st.sidebar.text_input("Stock Symbol", default_symbol).upper()
-    
-    # Add suffix for Indian stocks if not already present
-    if region == "India" and not symbol.endswith(".BO"):
-        symbol = symbol + symbol_suffix
-    
-    # Resolution selection
-    resolution = st.sidebar.selectbox(
-        "Resolution", 
-        ["D", "60", "30", "15", "5", "1"],
-        index=0  # Default to Daily
-    )
-    
-    # Convert resolution to days for lookback
-    if resolution == "D":
-        days_back = 200  # For longer-term view on daily resolution
-    elif resolution == "60":
-        days_back = 30
-    else:
-        days_back = 14
     
     # Auto refresh option
     auto_refresh = st.sidebar.checkbox("Auto Refresh Data", value=False)
@@ -858,18 +922,18 @@ def show_dashboard():
     with col1:
         # Get data and calculate indicators
         with st.spinner("Fetching data..."):
-            data = fetch_stock_data(symbol, resolution, days_back)
+            data = fetch_stock_data(symbol)
         
         if not data.empty:
             with st.spinner("Calculating indicators..."):
                 data_with_indicators = calculate_indicators(data)
             
             # Plot chart
-            fig = plot_chart(data_with_indicators, symbol, resolution)
+            fig = plot_chart(data_with_indicators, symbol)
             if fig:
                 st.plotly_chart(fig, use_container_width=True)
         else:
-            st.error(f"No data available for {symbol} with {resolution} resolution")
+            st.error(f"No data available for {symbol}")
     
     with col2:
         st.subheader("Signal Analysis")
@@ -886,10 +950,30 @@ def show_dashboard():
                 else:
                     st.markdown(f"<p class='neutral-signal'>⚪ NEUTRAL - {signal['confidence']}% Confidence</p>", unsafe_allow_html=True)
                 
+                # Display timeframe recommendation
+                if 'timeframe' in signal:
+                    st.markdown(f"<div class='timeframe-info'>✅ <b>Recommended holding period:</b> {signal['timeframe']}</div>", unsafe_allow_html=True)
+                
                 # Display reasons
                 st.subheader("Signal Reasons:")
                 for reason in signal['reasons']:
                     st.write(f"• {reason}")
+                
+                # Display signal breakdown with timeframes
+                if st.checkbox("Show detailed signal breakdown"):
+                    st.subheader("Signal Breakdown:")
+                    for s in signal['signals']:
+                        if 'timeframe' in s:
+                            timeframe_info = f" ({s['timeframe']})"
+                        else:
+                            timeframe_info = ""
+                            
+                        if s['type'] == 'BUY':
+                            st.markdown(f"<span style='color:green'>• BUY: {s['reason']}{timeframe_info} (+{s['points']} points)</span>", unsafe_allow_html=True)
+                        elif s['type'] == 'SELL':
+                            st.markdown(f"<span style='color:red'>• SELL: {s['reason']}{timeframe_info} (+{s['points']} points)</span>", unsafe_allow_html=True)
+                        else:
+                            st.markdown(f"<span style='color:orange'>• NEUTRAL: {s['reason']}{timeframe_info} (+{s['points']} points)</span>", unsafe_allow_html=True)
                 
                 # Display latest price data
                 latest = data.iloc[-1]
@@ -935,7 +1019,7 @@ def show_dashboard():
     if auto_refresh:
         st.write(f"Page will refresh in {refresh_interval} seconds")
         time.sleep(refresh_interval)
-        st.experimental_rerun()
+        st.rerun()  # Using rerun() instead of experimental_rerun()
 
 # Scanner page
 def show_scanner():
@@ -948,20 +1032,6 @@ def show_scanner():
     scan_mode = st.sidebar.radio(
         "Scan Mode",
         ["Quick Scan (Pre-selected)", "Custom Scan"]
-    )
-    
-    # Region selection
-    region = st.sidebar.selectbox(
-        "Market Region", 
-        ["US", "India", "Both"],
-        index=0
-    )
-    
-    # Resolution selection
-    resolution = st.sidebar.selectbox(
-        "Resolution", 
-        ["D", "60", "30", "15", "5"],
-        index=0  # Default to Daily
     )
     
     # Minimum confidence threshold
@@ -980,20 +1050,8 @@ def show_scanner():
     stocks_to_scan = []
     
     if scan_mode == "Quick Scan (Pre-selected)":
-        if region == "US" or region == "Both":
-            stocks_to_scan += [
-                "AAPL", "MSFT", "AMZN", "GOOGL", "META", 
-                "TSLA", "NVDA", "JPM", "BAC", "V", 
-                "JNJ", "PG", "UNH", "HD", "XOM"
-            ]
-        
-        if region == "India" or region == "Both":
-            stocks_to_scan += [
-                "RELIANCE.BO", "TCS.BO", "HDFCBANK.BO", "INFY.BO", "ICICIBANK.BO",
-                "HINDUNILVR.BO", "SBIN.BO", "BHARTIARTL.BO", "BAJFINANCE.BO", "KOTAKBANK.BO"
-            ]
-        
-        st.write(f"Scanning {len(stocks_to_scan)} stocks at {resolution} resolution...")
+        stocks_to_scan = get_us_stock_universe()
+        st.write(f"Scanning {len(stocks_to_scan)} US stocks...")
     else:
         # Custom stock input
         custom_input = st.sidebar.text_area(
@@ -1003,12 +1061,7 @@ def show_scanner():
         
         # Parse input
         stocks_to_scan = [s.strip().upper() for s in custom_input.split(",")]
-        
-        # Add BO suffix to Indian stocks if region is India and they don't have it
-        if region == "India":
-            stocks_to_scan = [s + ".BO" if not s.endswith(".BO") else s for s in stocks_to_scan]
-        
-        st.write(f"Scanning {len(stocks_to_scan)} custom stocks at {resolution} resolution...")
+        st.write(f"Scanning {len(stocks_to_scan)} custom stocks...")
     
     # Display stock list
     with st.expander("View stocks to scan"):
@@ -1017,7 +1070,7 @@ def show_scanner():
     # Scan button
     if st.button("Run Scan"):
         with st.spinner("Scanning for signals..."):
-            signals = scan_for_signals(stocks_to_scan, resolution, min_confidence)
+            signals = scan_for_signals(stocks_to_scan, min_confidence)
             
             # Filter by direction if needed
             if signal_direction == "Buy Only":
@@ -1031,11 +1084,13 @@ def show_scanner():
                 # Display signals in a table first (summary)
                 signal_data = []
                 for signal in signals:
+                    timeframe = signal.get('timeframe', 'Medium-term')
                     signal_data.append({
                         'Symbol': signal['symbol'],
                         'Direction': signal['direction'],
                         'Confidence': f"{signal['confidence']}%",
                         'Last Price': f"${signal['last_price']:.2f}" if 'last_price' in signal else "N/A",
+                        'Timeframe': timeframe,
                         'Time': signal['timestamp']
                     })
                 
@@ -1053,6 +1108,10 @@ def show_scanner():
                         st.markdown(f"""
                         ### 🔴 SELL - {signal['symbol']} - {signal['confidence']}% Confidence
                         """)
+                    
+                    # Display recommended timeframe
+                    if 'timeframe' in signal:
+                        st.markdown(f"<div class='timeframe-info'>✅ <b>Recommended holding period:</b> {signal['timeframe']}</div>", unsafe_allow_html=True)
                     
                     # Display current price if available
                     if 'last_price' in signal:
@@ -1084,7 +1143,7 @@ def show_real_time_monitor():
     # Symbol selection
     monitoring_symbols = st.sidebar.multiselect(
         "Select symbols to monitor",
-        options=get_stock_universe(),
+        options=get_us_stock_universe(),
         default=["AAPL", "MSFT", "AMZN"]
     )
     
@@ -1155,14 +1214,14 @@ def show_real_time_monitor():
     auto_refresh = st.checkbox("Auto-refresh quotes", value=True)
     if auto_refresh:
         time.sleep(5)  # Refresh every 5 seconds
-        st.experimental_rerun()
+        st.rerun()  # Using rerun() instead of experimental_rerun()
 
 # Documentation page
 def show_documentation():
-    st.title("📚 Technical Indicator Documentation")
+    st.title("📚 Technical Trading Signal System")
     
     st.markdown("""
-    This documentation explains the technical indicators used in this system and how they're applied to generate trading signals.
+    This dashboard analyzes stocks using technical indicators to generate trading signals with confidence scores and recommended timeframes.
     """)
     
     with st.expander("System Overview", expanded=True):
@@ -1171,13 +1230,29 @@ def show_documentation():
         
         Our technical analysis system follows this process flow:
         
-        1. **Data Acquisition**: Fetches market data from Finnhub API
+        1. **Data Acquisition**: Fetches market data from Finnhub API with daily resolution
         2. **Indicator Calculation**: Calculates technical indicators on the data
         3. **Signal Generation**: Identifies potential trading signals
         4. **Confidence Scoring**: Assigns confidence scores to signals
-        5. **Trade Selection**: Filters for high-probability trades
+        5. **Timeframe Analysis**: Determines appropriate holding periods for trades
         
         The system uses a point-based scoring system, with trades requiring a minimum 65% confidence score to be displayed.
+        """)
+    
+    with st.expander("Trading Timeframes"):
+        st.markdown("""
+        ### Signal Timeframes
+        
+        The system categorizes signals by their optimal holding period:
+        
+        | Timeframe | Holding Period | Indicators |
+        |-----------|----------------|------------|
+        | Very Short-term | 1-3 days | Stochastic RSI |
+        | Short-term | 3-10 days | RSI, Bollinger Bands |
+        | Medium-term | 2-4 weeks | MACD, EMA Cloud |
+        | Long-term | 1-3 months | EMA50 vs EMA200 |
+        
+        The overall timeframe recommendation is based on the strongest signals present.
         """)
     
     with st.expander("Core Indicators"):
@@ -1186,243 +1261,103 @@ def show_documentation():
         
         #### MACD (Moving Average Convergence Divergence)
         
-        **What it is**: The MACD is a trend-following momentum indicator that shows the relationship between two moving averages of a security's price.
+        **What it is**: Trend-following momentum indicator showing relationship between 12-day and 26-day EMAs
         
-        **How it's calculated**: 
-        - MACD Line = 12-period EMA - 26-period EMA
-        - Signal Line = 9-period EMA of MACD Line
-        - Histogram = MACD Line - Signal Line
+        **Signal strength**: 15 points for crossover signals
         
-        **How it's used**:
-        - Bullish signal: MACD line crosses above signal line
-        - Bearish signal: MACD line crosses below signal line
-        - Histogram increasing: Momentum is increasing
-        - Zero line crossovers: Potential trend changes
-        
-        **Points awarded**: 15 points for crossover signals
+        **Optimal timeframe**: Medium-term (2-4 weeks)
         
         ---
         
         #### RSI (Relative Strength Index)
         
-        **What it is**: A momentum oscillator that measures the speed and change of price movements, oscillating between 0 and 100.
+        **What it is**: Momentum oscillator measuring overbought/oversold conditions
         
-        **How it's calculated**: 
-        RSI = 100 - (100 / (1 + RS))
-        where RS = Average Gain / Average Loss over 14 periods
+        **Signal strength**: 10 points for overbought/oversold
         
-        **How it's used**:
-        - Overbought: RSI > 70
-        - Oversold: RSI < 30
-        - Divergence: Price makes new high/low but RSI doesn't confirm
-        
-        **Points awarded**: 10 points for oversold/overbought conditions
+        **Optimal timeframe**: Short-term (3-5 days)
         
         ---
         
         #### Bollinger Bands
         
-        **What it is**: A volatility indicator that creates a band around the price movement.
+        **What it is**: Volatility bands around price movement
         
-        **How it's calculated**: 
-        - Middle Band = 20-period SMA
-        - Upper Band = Middle Band + (2 * Standard Deviation)
-        - Lower Band = Middle Band - (2 * Standard Deviation)
-        - %B = (Price - Lower Band) / (Upper Band - Lower Band)
+        **Signal strength**: 10 points for price near bands
         
-        **How it's used**:
-        - Price near upper band: Potentially overbought
-        - Price near lower band: Potentially oversold
-        - Narrow bands (squeeze): Potential for volatility breakout
-        - Wide bands: High volatility environment
-        
-        **Points awarded**: 10 points for price near bands, 5 points for squeeze
+        **Optimal timeframe**: Short-term (3-7 days)
         
         ---
         
         #### EMA Cloud (8 & 21)
         
-        **What it is**: A trend identification system using two exponential moving averages.
+        **What it is**: Trend identification using short-term EMAs
         
-        **How it's calculated**: 
-        - Fast EMA = 8-period EMA
-        - Slow EMA = 21-period EMA
+        **Signal strength**: 10 points for alignment
         
-        **How it's used**:
-        - Bullish: Fast EMA above Slow EMA
-        - Bearish: Fast EMA below Slow EMA
-        - Crossovers: Potential trend changes
-        
-        **Points awarded**: 10 points for alignment with direction
-        """)
-    
-    with st.expander("Supporting Indicators"):
-        st.markdown("""
-        ### Secondary Indicators
-        
-        #### Volume Analysis
-        
-        **Components**:
-        - Volume Z-Score: Measures how current volume compares to average
-        - On Balance Volume (OBV): Cumulative indicator that adds volume on up days and subtracts on down days
-        
-        **How it's used**:
-        - High volume confirms price movement
-        - Divergence between OBV and price can signal potential reversals
-        
-        **Points awarded**: 10 points for strong volume confirmation
+        **Optimal timeframe**: Short-term (1-2 weeks)
         
         ---
         
-        #### ADX (Average Directional Index)
+        #### Long-term Trend (EMA50 vs EMA200)
         
-        **What it is**: Measures trend strength regardless of direction.
+        **What it is**: Long-term trend alignment
         
-        **How it's calculated**: Uses the difference between +DI and -DI smoothed over 14 periods.
+        **Signal strength**: 10 points
         
-        **How it's used**:
-        - ADX > 25: Strong trend present
-        - ADX < 20: Weak or no trend
-        
-        **Points awarded**: 10 points for strong trend identification
-        
-        ---
-        
-        #### Stochastic RSI
-        
-        **What it is**: Applies the Stochastic formula to RSI values instead of price.
-        
-        **How it's calculated**: 
-        - Take RSI values and calculate where current RSI stands relative to its high/low range over 14 periods
-        
-        **How it's used**:
-        - Values above 80 are considered overbought
-        - Values below 20 are considered oversold
-        - Crossovers between %K and %D lines signal potential reversals
-        
-        **Points awarded**: 5 points for oversold/overbought conditions, 5 points for crossovers
+        **Optimal timeframe**: Long-term (1-3 months)
         """)
     
     with st.expander("Signal Generation System"):
         st.markdown("""
-        ### Signal Generation Process
+        ### Confidence Score Calculation
         
-        #### Confidence Scoring
-        
-        The system uses a point-based algorithm to determine confidence:
+        The system uses a point-based algorithm:
         
         **Starting Base**: 50 points
         
-        **Additional Points**:
+        **Signal Strength**:
         - MACD Crossover: +15 points
-        - EMA Cloud alignment: +10 points
+        - EMA alignments: +10 points each
         - RSI conditions: +10 points
         - Bollinger Band signals: +10 points
         - Volume confirmation: +10 points
         - ADX trend strength: +10 points
         - Stochastic RSI signals: +5 points
         
-        The final confidence score is capped at 95%, acknowledging that no trading signal can be 100% certain.
+        **Final Score**: Capped at 95% confidence
         
-        #### Signal Types
+        ### Trading Signal Classification
         
-        The system identifies three types of signals:
+        - **BUY Signals**: Generated when bullish indicators outweigh bearish ones
+        - **SELL Signals**: Generated when bearish indicators outweigh bullish ones
+        - **NEUTRAL**: When there's no clear direction or confidence is below threshold
         
-        1. **BUY Signals**: Generated when bullish indicators outweigh bearish ones
-           - Highest confidence buy signals typically have MACD, EMA, and volume all aligned
-        
-        2. **SELL Signals**: Generated when bearish indicators outweigh bullish ones
-           - Highest confidence sell signals typically have MACD crossdown with overbought RSI
-        
-        3. **NEUTRAL**: When there's no clear direction or confidence is below threshold
-        
-        #### Filtering Logic
-        
-        Only signals with 65% or higher confidence are displayed, focusing on high-probability setups.
+        The recommended timeframe is determined by the strongest contributing signals.
         """)
     
-    with st.expander("Best Practices & Trading Strategy"):
+    with st.expander("Best Practices for Trading"):
         st.markdown("""
         ### How to Use This System Effectively
         
         #### Best Practices
         
-        1. **Confluence of Signals**: The most reliable trades occur when multiple indicators align
+        1. **Timeframe Alignment**: Trade according to the recommended holding period
         
-        2. **Trending Markets**: Technical indicators work best in trending markets (ADX > 25)
+        2. **Confirmation**: Look for multiple indicators supporting the same direction
         
-        3. **Timeframe Alignment**: Check multiple timeframes for confirmation
-           - Ideal setup: Signal present on 15-min, 1-hour, and daily charts
+        3. **Strong Trends**: Pay attention to ADX values above 25 (indicates strong trend)
         
-        4. **Volume Confirmation**: Always verify signals with volume analysis
-           - Strong signals should have above-average volume
+        4. **Volume Confirmation**: Ensure signals are supported by above-average volume
         
-        5. **Risk Management**: No technical system is 100% accurate
-           - Always use stop-losses
-           - Position sizing based on account risk (1-2% maximum risk per trade)
+        5. **Risk Management**: Always use stop-losses (typically 5-7% for swing trades)
         
-        #### Highest Probability Setups
+        #### Risk Management Guidelines
         
-        1. **Momentum + Confirmation + Volume Trio**:
-           - RSI moving up from midrange (40-60)
-           - MACD bullish crossover
-           - Above average volume
-        
-        2. **Reversal Setups**:
-           - RSI divergence (price makes new high/low but RSI doesn't)
-           - MACD histogram reversal
-           - Volume spike on reversal day
-        
-        3. **Trend Continuation**:
-           - Price pullback to EMA8/21 cloud
-           - MACD stays above zero line (for uptrends)
-           - Volume decreases on pullback, increases on continuation
-        """)
-    
-    with st.expander("System Limitations"):
-        st.markdown("""
-        ### Understanding System Limitations
-        
-        #### Market Condition Limitations
-        
-        1. **Sideways Markets**: Technical indicators generate more false signals in non-trending markets
-        
-        2. **Extreme Volatility**: During market crashes or unusual events, correlations and patterns may break down
-        
-        3. **Low Liquidity**: Signals may be less reliable for stocks with low trading volume
-        
-        #### Technical Limitations
-        
-        1. **API Restrictions**: Finnhub's free tier has limitations on data availability and request frequency
-        
-        2. **Processing Time**: Scanning many stocks simultaneously takes time
-        
-        3. **Historical Context**: System uses limited historical data for calculations
-        
-        #### Remember
-        
-        This system is a tool to identify potential trades with higher probability, not a guaranteed profit system. Always combine with fundamental analysis and proper risk management for best results.
-        """)
-    
-    with st.expander("About Finnhub API"):
-        st.markdown("""
-        ### About Finnhub API
-        
-        This application uses Finnhub.io API for market data. Finnhub provides:
-        
-        - Real-time stock data
-        - Technical indicators
-        - Company information
-        - News and sentiment analysis
-        
-        The free tier of Finnhub allows:
-        - 60 API calls per minute
-        - Access to delayed market data
-        - Limited historical data
-        
-        For more information, visit [Finnhub.io](https://finnhub.io/)
+        - Position sizing: 1-2% account risk per trade
+        - Stop loss placement: Below recent support for buys, above recent resistance for sells
+        - Take profits: Use the recommended timeframe as a guide for exit strategy
         """)
 
-# Run the app
 if __name__ == "__main__":
     main()
