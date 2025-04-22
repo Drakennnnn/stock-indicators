@@ -1410,8 +1410,6 @@ def show_real_time_monitor():
     st.subheader("Current Quotes")
     
     quotes_data = []
-    for symbol in monitoring
-    quotes_data = []
     for symbol in monitoring_symbols:
         try:
             # Get quote data
