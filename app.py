@@ -670,10 +670,6 @@ def generate_signals(df, preferred_timeframe="short"):
                 'direction': 'SELL',
                 'confidence': final_confidence,
                 'signals': signals,
-                'reasons': [s['reason']
-                'direction': 'SELL',
-                'confidence': final_confidence,
-                'signals': signals,
                 'reasons': [s['reason'] for s in signals if s['type'] == 'SELL' or s['type'] == 'NEUTRAL'],
                 'timeframe': recommended_timeframe
             }
