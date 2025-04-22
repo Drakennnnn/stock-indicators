@@ -670,6 +670,10 @@ def generate_signals(df, preferred_timeframe="short"):
                 'direction': 'SELL',
                 'confidence': final_confidence,
                 'signals': signals,
+                'reasons': [s['reason']
+                'direction': 'SELL',
+                'confidence': final_confidence,
+                'signals': signals,
                 'reasons': [s['reason'] for s in signals if s['type'] == 'SELL' or s['type'] == 'NEUTRAL'],
                 'timeframe': recommended_timeframe
             }
@@ -1381,10 +1385,13 @@ def show_real_time_monitor():
     # Settings
     st.sidebar.header("Real-time Settings")
     
+    # Get stock symbols from the loaded universe
+    symbol_options = [s[0] for s in st.session_state.stock_universe[:100]]  # First 100 stocks
+    
     # Symbol selection
     monitoring_symbols = st.sidebar.multiselect(
         "Select symbols to monitor",
-        options=get_us_stock_universe(),
+        options=symbol_options,
         default=["AAPL", "MSFT", "AMZN"]
     )
     
@@ -1406,6 +1413,8 @@ def show_real_time_monitor():
     # Show current quotes for selected symbols
     st.subheader("Current Quotes")
     
+    quotes_data = []
+    for symbol in monitoring
     quotes_data = []
     for symbol in monitoring_symbols:
         try:
