@@ -16,10 +16,6 @@ from io import StringIO
 import csv
 import pickle
 import os
-import random
-import string
-import re
-from bs4 import BeautifulSoup
 
 # Set page configuration
 st.set_page_config(
@@ -29,9 +25,9 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# API keys - initialize at the module level
+# API keys
 FINNHUB_API_KEY = "d03bkkpr01qvvb93ems0d03bkkpr01qvvb93emsg"  # For real-time data
-ALPHA_VANTAGE_API_KEY = "SDOOH70UR19JH1L5"  # For historical data
+ALPHA_VANTAGE_API_KEY = "BY8DWVP73ZRGRGWO"  # For historical data
 
 # Data persistence functions
 def save_paper_trading_data():
@@ -69,90 +65,13 @@ def load_paper_trading_data():
         st.error(f"Error loading paper trading data: {e}")
         return False
 
-# Function to generate Alpha Vantage API key automatically
-def generate_alpha_vantage_key():
-    """Generate a new Alpha Vantage API key via web scraping"""
-    # Declare global variable at the beginning of the function
-    global ALPHA_VANTAGE_API_KEY
-    
-    try:
-        # URL for Alpha Vantage key generation
-        url = "https://www.alphavantage.co/support/#api-key"
-        
-        # Generate random user info
-        random_name = f"User{random.randint(1000, 9999)}"
-        random_email = f"user{random.randint(1000, 9999)}@example.com"
-        random_org = f"Organization{random.randint(100, 999)}"
-        
-        # First make a GET request to get any CSRF tokens or cookies
-        session = requests.Session()
-        response = session.get(url)
-        
-        # Parse the HTML to find the form
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        # Find form elements (Note: actual form field names would need to be identified from the page)
-        form_data = {
-            "First Name": random_name,
-            "Email": random_email,
-            "Organization": random_org,
-            "Type": "Investor"  # Based on the form options shown in the image
-        }
-        
-        # Make POST request to submit the form (URL might be different)
-        submit_url = "https://www.alphavantage.co/support/#api-key"  # This might need to be updated
-        response = session.post(submit_url, data=form_data)
-        
-        # Parse response to find API key
-        if response.status_code == 200:
-            # Look for API key in the response
-            soup = BeautifulSoup(response.text, 'html.parser')
-            
-            # Try to find the API key in the response (pattern may vary)
-            api_key_pattern = re.compile(r'[A-Z0-9]{16}')  # Assuming API key is 16 chars of letters/numbers
-            
-            # Look for text containing the API key
-            potential_elements = soup.find_all(string=api_key_pattern)
-            
-            if potential_elements:
-                # Extract the key using regex
-                for element in potential_elements:
-                    match = api_key_pattern.search(element)
-                    if match:
-                        new_key = match.group(0)
-                        
-                        # Store in session state
-                        st.session_state.alpha_vantage_key = new_key
-                        
-                        # Update the global variable (already declared at function start)
-                        ALPHA_VANTAGE_API_KEY = new_key
-                        
-                        # Save the key
-                        save_api_keys()
-                        
-                        return new_key
-            
-            # Fallback: Use a demo key for simulated success (for testing only)
-            fallback_key = ''.join(random.choices(string.ascii_uppercase + string.digits, k=16))
-            st.session_state.alpha_vantage_key = fallback_key
-            ALPHA_VANTAGE_API_KEY = fallback_key
-            save_api_keys()
-            return fallback_key
-                
-        st.error("Failed to generate API key. Please try again or get a key manually.")
-        return None
-    
-    except Exception as e:
-        st.error(f"Error generating Alpha Vantage API key: {e}")
-        return None
-
 # Function to save API keys to disk
 def save_api_keys():
     """Save API keys to disk"""
     try:
         keys_to_save = {
-            'alpha_vantage': st.session_state.get('alpha_vantage_key', ALPHA_VANTAGE_API_KEY),
-            'finnhub': FINNHUB_API_KEY  # Always use the constant value
+            'alpha_vantage': ALPHA_VANTAGE_API_KEY,
+            'finnhub': FINNHUB_API_KEY
         }
         
         with open('api_keys.json', 'w') as f:
@@ -165,14 +84,13 @@ def save_api_keys():
 # Function to load API keys from disk
 def load_api_keys():
     """Load API keys from disk"""
-    global ALPHA_VANTAGE_API_KEY  # Declare global at function start
+    global ALPHA_VANTAGE_API_KEY
     
     try:
         if os.path.exists('api_keys.json'):
             with open('api_keys.json', 'r') as f:
                 keys = json.load(f)
                 if 'alpha_vantage' in keys:
-                    st.session_state.alpha_vantage_key = keys['alpha_vantage']
                     ALPHA_VANTAGE_API_KEY = keys['alpha_vantage']
             return True
         return False
@@ -206,7 +124,7 @@ TIMEFRAMES = {
 # Initialize session state for stock universe if not exists
 if 'stock_universe' not in st.session_state:
     st.session_state.stock_universe = None
-
+    
 # Initialize paper trading session state
 def initialize_paper_trading():
     if 'paper_portfolio' not in st.session_state:
