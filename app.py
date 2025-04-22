@@ -6,7 +6,7 @@ from plotly.subplots import make_subplots
 import finnhub
 import requests
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 import pytz
 import websocket
 import json
@@ -84,7 +84,7 @@ def save_api_keys():
 # Function to load API keys from disk
 def load_api_keys():
     """Load API keys from disk"""
-    global ALPHA_VANTAGE_API_KEY
+    global ALPHA_VANTAGE_API_KEY, FINNHUB_API_KEY
     
     try:
         if os.path.exists('api_keys.json'):
@@ -92,6 +92,8 @@ def load_api_keys():
                 keys = json.load(f)
                 if 'alpha_vantage' in keys:
                     ALPHA_VANTAGE_API_KEY = keys['alpha_vantage']
+                if 'finnhub' in keys:
+                    FINNHUB_API_KEY = keys['finnhub']
             return True
         return False
     except Exception as e:
@@ -293,7 +295,7 @@ def load_stock_universe():
             st.session_state.stock_universe = get_extended_stock_universe()
     return st.session_state.stock_universe
 
-# Function to fetch historical data from Alpha Vantage
+# Function to fetch historical daily data from Alpha Vantage
 @st.cache_data(ttl=3600)  # Cache data for 1 hour
 def fetch_alpha_vantage_daily(symbol, timeframe="short"):
     try:
@@ -337,10 +339,75 @@ def fetch_alpha_vantage_daily(symbol, timeframe="short"):
         # Reset index and rename it to 'timestamp' to maintain compatibility
         df = df.reset_index().rename(columns={'index': 'timestamp'})
         
+        # Add data source column
+        df['data_source'] = 'daily'
+        
         return df
         
     except Exception as e:
-        st.error(f"Error fetching data for {symbol} from Alpha Vantage: {e}")
+        st.error(f"Error fetching daily data for {symbol} from Alpha Vantage: {e}")
+        return pd.DataFrame()
+
+# NEW FUNCTION: Fetch intraday data from Alpha Vantage for the current trading day
+@st.cache_data(ttl=300)  # Cache data for 5 minutes
+def fetch_alpha_vantage_intraday(symbol, interval='15min'):
+    """
+    Fetch intraday data from Alpha Vantage
+    
+    Parameters:
+    symbol (str): The stock symbol
+    interval (str): Time interval between data points - 1min, 5min, 15min, 30min, 60min
+    
+    Returns:
+    pd.DataFrame: DataFrame with intraday OHLCV data
+    """
+    try:
+        # Make API call to Alpha Vantage for intraday data
+        url = f'https://www.alphavantage.co/query?function=TIME_SERIES_INTRADAY&symbol={symbol}&interval={interval}&outputsize=compact&apikey={ALPHA_VANTAGE_API_KEY}'
+        response = requests.get(url)
+        data = response.json()
+        
+        # Check if data was returned successfully
+        if f"Time Series ({interval})" not in data:
+            st.warning(f"No intraday data found for {symbol} in Alpha Vantage. Error: {data.get('Information', 'Unknown error')}")
+            return pd.DataFrame()
+        
+        # Convert to DataFrame
+        df = pd.DataFrame(data[f"Time Series ({interval})"]).T
+        df = df.rename(columns={
+            '1. open': 'open',
+            '2. high': 'high',
+            '3. low': 'low',
+            '4. close': 'close',
+            '5. volume': 'volume'
+        })
+        
+        # Convert columns to numeric values
+        for col in df.columns:
+            df[col] = pd.to_numeric(df[col])
+        
+        # Add datetime index
+        df.index = pd.to_datetime(df.index)
+        df = df.sort_index()
+        
+        # Filter for only today's data
+        today = datetime.now().date()
+        df = df[df.index.date == today]
+        
+        # If no data for today (e.g., market not open yet), return empty DataFrame
+        if df.empty:
+            return pd.DataFrame()
+        
+        # Reset index and rename it to 'timestamp' to maintain compatibility
+        df = df.reset_index().rename(columns={'index': 'timestamp'})
+        
+        # Add data source column
+        df['data_source'] = 'intraday'
+        
+        return df
+        
+    except Exception as e:
+        st.warning(f"Error fetching intraday data for {symbol} from Alpha Vantage: {e}")
         return pd.DataFrame()
 
 # Function to get current quote from Finnhub (real-time)
@@ -351,6 +418,80 @@ def get_current_quote(symbol):
     except Exception as e:
         st.warning(f"Error fetching current quote for {symbol}: {e}")
         return None
+
+# NEW FUNCTION: Create a comprehensive dataset combining daily, intraday, and real-time data
+def create_comprehensive_dataset(symbol, timeframe="short"):
+    """
+    Create a comprehensive dataset combining historical daily data, 
+    intraday data for the current day, and the latest real-time quote.
+    
+    Parameters:
+    symbol (str): The stock symbol
+    timeframe (str): The timeframe for historical data ("short", "medium", "long")
+    
+    Returns:
+    pd.DataFrame: A combined DataFrame with all available data
+    """
+    # Step 1: Get historical daily data from Alpha Vantage
+    daily_df = fetch_alpha_vantage_daily(symbol, timeframe)
+    if daily_df.empty:
+        st.error(f"Could not fetch historical daily data for {symbol}")
+        return pd.DataFrame()
+    
+    # Check if we already have today's data in daily dataset
+    today = datetime.now().date()
+    today_in_daily = any(d.date() == today for d in daily_df['timestamp'])
+    
+    # Step 2: Get intraday data for the current day if needed
+    if not today_in_daily:
+        intraday_df = fetch_alpha_vantage_intraday(symbol, interval='15min')
+        
+        if not intraday_df.empty:
+            # Get the earliest intraday data point for today's open
+            earliest_intraday = intraday_df.iloc[0]
+            latest_intraday = intraday_df.iloc[-1]
+            
+            # Construct a daily bar for today based on intraday data
+            today_ohlc = {
+                'timestamp': pd.Timestamp(today),
+                'open': earliest_intraday['open'],
+                'high': intraday_df['high'].max(),
+                'low': intraday_df['low'].min(),
+                'close': latest_intraday['close'],
+                'volume': intraday_df['volume'].sum(),
+                'data_source': 'intraday_aggregated'
+            }
+            
+            # Create a DataFrame for today's aggregated data
+            today_df = pd.DataFrame([today_ohlc])
+            
+            # Append to historical daily data
+            combined_df = pd.concat([daily_df, today_df], ignore_index=True)
+        else:
+            # No intraday data available, use historical only
+            combined_df = daily_df.copy()
+    else:
+        # We already have today's data in the daily dataset
+        combined_df = daily_df.copy()
+    
+    # Step 3: Update the latest price with real-time quote from Finnhub if available
+    quote = get_current_quote(symbol)
+    if quote and 'c' in quote and quote['c'] > 0:
+        real_time_price = quote['c']
+        
+        # Update the most recent close price with real-time data
+        last_idx = combined_df['timestamp'] == combined_df['timestamp'].max()
+        combined_df.loc[last_idx, 'close'] = real_time_price
+        combined_df.loc[last_idx, 'data_source'] = 'realtime'
+        
+        # If real-time price is higher/lower than the day's high/low, update those too
+        if real_time_price > combined_df.loc[last_idx, 'high'].values[0]:
+            combined_df.loc[last_idx, 'high'] = real_time_price
+        
+        if real_time_price < combined_df.loc[last_idx, 'low'].values[0]:
+            combined_df.loc[last_idx, 'low'] = real_time_price
+    
+    return combined_df
 
 # Calculate all technical indicators
 def calculate_indicators(df):
@@ -789,7 +930,7 @@ def generate_signals(df, preferred_timeframe="short"):
         st.error(f"Error generating signals: {e}")
         return None
 
-# Enhanced signal generation with real-time price updates
+# Enhanced signal generation with comprehensive data
 def generate_enhanced_signals(stocks, min_confidence=65, timeframe="short"):
     all_signals = []
     progress_bar = st.progress(0)
@@ -803,43 +944,41 @@ def generate_enhanced_signals(stocks, min_confidence=65, timeframe="short"):
             if i > 0 and i % 5 == 0:
                 time.sleep(12)
             
-            # Step 1: Get historical data from Alpha Vantage for indicators
-            df = fetch_alpha_vantage_daily(symbol, timeframe)
+            # Step 1: Get comprehensive data with daily, intraday, and real-time prices
+            df = create_comprehensive_dataset(symbol, timeframe)
             if df.empty:
                 continue
             
-            # Store the historical price before updating
-            historical_price = df['close'].iloc[-1]
-            historical_date = df['timestamp'].iloc[-1]
+            # Store the price information
+            last_timestamp = df['timestamp'].max()
+            last_row = df[df['timestamp'] == last_timestamp].iloc[0]
+            current_price = last_row['close']
+            data_source = last_row['data_source']
             
-            # Step 2: Get real-time price from Finnhub
-            quote = get_current_quote(symbol)
-            if not quote or 'c' not in quote:
-                # If we can't get current quote, use historical price but mark it
-                real_time_price = historical_price
-                price_warning = True
+            # Get the previous day's close for comparison
+            prev_day_rows = df[(df['timestamp'] < last_timestamp) & (df['data_source'] == 'daily')]
+            if not prev_day_rows.empty:
+                prev_close = prev_day_rows.iloc[-1]['close']
+                prev_date = prev_day_rows.iloc[-1]['timestamp']
             else:
-                real_time_price = quote['c']
-                price_warning = False
-                
-                # Step 3: Update the last day's close price with real-time data
-                # This is crucial for any indicators that use the most recent price
-                df.loc[df.index[-1], 'close'] = real_time_price
+                prev_close = current_price
+                prev_date = last_timestamp
             
             # Step 4: Calculate indicators with the updated data
             df = calculate_indicators(df)
             
-            # Step 5: Generate signal based on updated data
+            # Step 5: Generate signal based on comprehensive data
             signal = generate_signals(df, timeframe)
             
             if signal and signal['confidence'] >= min_confidence and signal['direction'] != 'NEUTRAL':
-                # Add both prices to the signal data
+                # Add price and data source information to the signal data
                 signal['symbol'] = symbol
                 signal['timestamp'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                signal['last_price'] = real_time_price
-                signal['historical_price'] = historical_price
-                signal['historical_date'] = historical_date.strftime("%Y-%m-%d")
-                signal['price_diff_pct'] = ((real_time_price - historical_price) / historical_price) * 100
+                signal['last_price'] = current_price
+                signal['prev_close'] = prev_close
+                signal['prev_date'] = prev_date.strftime("%Y-%m-%d")
+                signal['price_diff_pct'] = ((current_price - prev_close) / prev_close) * 100
+                signal['data_source'] = data_source
                 
                 # Adjust confidence if prices have significant difference
                 price_diff_abs = abs(signal['price_diff_pct'])
@@ -848,9 +987,9 @@ def generate_enhanced_signals(stocks, min_confidence=65, timeframe="short"):
                     # Flag for significant price movement since last close
                     signal['price_warning'] = True
                     
-                    # For large moves that oppose the signal direction
-                    if (signal['direction'] == 'BUY' and real_time_price > historical_price) or \
-                       (signal['direction'] == 'SELL' and real_time_price < historical_price):
+                    # For large moves that align with the signal direction
+                    if (signal['direction'] == 'BUY' and current_price > prev_close) or \
+                       (signal['direction'] == 'SELL' and current_price < prev_close):
                         # Price moved in favor of signal - reinforce confidence
                         signal['confidence'] = min(95, signal['confidence'] + 5)
                         signal['confidence_adjustment'] = "Increased"
@@ -868,7 +1007,7 @@ def generate_enhanced_signals(stocks, min_confidence=65, timeframe="short"):
     all_signals.sort(key=lambda x: x['confidence'], reverse=True)
     return all_signals
 
-# Function to scan for signals (without real-time price updates)
+# Function to scan for signals (using comprehensive data)
 def scan_for_signals(stocks, min_confidence=65, timeframe="short"):
     all_signals = []
     progress_bar = st.progress(0)
@@ -882,8 +1021,8 @@ def scan_for_signals(stocks, min_confidence=65, timeframe="short"):
             if i > 0 and i % 5 == 0:
                 time.sleep(12)
             
-            # Get historical data
-            df = fetch_alpha_vantage_daily(symbol, timeframe)
+            # Get comprehensive data
+            df = create_comprehensive_dataset(symbol, timeframe)
             if df.empty:
                 continue
             
@@ -897,7 +1036,11 @@ def scan_for_signals(stocks, min_confidence=65, timeframe="short"):
                 # Add symbol and price info
                 signal['symbol'] = symbol
                 signal['timestamp'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                signal['last_price'] = df['close'].iloc[-1]  # Use last historical price
+                
+                # Get the current price from the last row
+                last_timestamp = df['timestamp'].max()
+                signal['last_price'] = df[df['timestamp'] == last_timestamp]['close'].values[0]
+                signal['data_source'] = df[df['timestamp'] == last_timestamp]['data_source'].values[0]
                 
                 all_signals.append(signal)
         except Exception as e:
@@ -1294,7 +1437,7 @@ def plot_chart(df, symbol):
         
         # Update layout
         fig.update_layout(
-            title=f'{symbol} - Daily Chart',
+            title=f'{symbol} - Chart with Comprehensive Data',
             xaxis_title='Date',
             yaxis_title='Price',
             height=900,
@@ -1577,6 +1720,13 @@ def main():
         margin-top: 10px;
         border-left: 5px solid #ffc107;
     }
+    .data-source-info {
+        background-color: #e8f5e9;
+        padding: 10px;
+        border-radius: 5px;
+        margin-top: 10px;
+        border-left: 5px solid #4CAF50;
+    }
     </style>
     """, unsafe_allow_html=True)
     
@@ -1588,7 +1738,8 @@ def main():
     st.sidebar.markdown("""
     <div class="api-info">
     <strong>Data Sources:</strong><br>
-    - Historical data: Alpha Vantage<br>
+    - Historical daily data: Alpha Vantage<br>
+    - Intraday data: Alpha Vantage<br>
     - Real-time data: Finnhub<br>
     <small>Free tier: 25 API calls per day</small>
     </div>
@@ -1607,7 +1758,7 @@ def main():
 
 # Dashboard page
 def show_dashboard():
-    st.markdown('<p class="big-font">📈 Technical Trading Signal Dashboard</p>', unsafe_allow_html=True)
+    st.markdown('<p class="big-font">📈 Enhanced Technical Trading Signal Dashboard</p>', unsafe_allow_html=True)
     
     # Settings in sidebar
     st.sidebar.header("Dashboard Settings")
@@ -1668,34 +1819,29 @@ def show_dashboard():
     col1, col2 = st.columns([2, 1])
     
     with col1:
-        # Get historical data from Alpha Vantage
-        with st.spinner("Fetching historical data..."):
-            data = fetch_alpha_vantage_daily(symbol, selected_timeframe)
+        # Get comprehensive data (daily + intraday + real-time)
+        with st.spinner("Fetching comprehensive data..."):
+            data = create_comprehensive_dataset(symbol, selected_timeframe)
         
         if not data.empty:
-            # Get real-time price from Finnhub
-            quote = get_current_quote(symbol)
-            historical_price = data['close'].iloc[-1]
+            # Display data source information
+            last_idx = data.index[-1]
+            data_source = data.loc[last_idx, 'data_source']
+            source_display = {
+                'daily': 'Historical Daily Data',
+                'intraday': 'Intraday Data',
+                'intraday_aggregated': 'Aggregated Intraday Data',
+                'realtime': 'Real-time Price'
+            }
+            source_text = source_display.get(data_source, data_source)
             
-            # Display current vs. historical price
-            if quote and 'c' in quote:
-                real_time_price = quote['c']
-                data.loc[data.index[-1], 'close'] = real_time_price  # Update last close with real-time price
-                
-                price_diff = real_time_price - historical_price
-                price_diff_pct = (price_diff / historical_price) * 100
-                
-                st.sidebar.success(f"Last Price (Finnhub): ${real_time_price:.2f}")
-                
-                if abs(price_diff_pct) > 0.5:  # If price difference is significant
-                    color = "green" if price_diff > 0 else "red"
-                    st.sidebar.markdown(f"<p style='color:{color}'>Change from last close: {price_diff:.2f} ({price_diff_pct:.2f}%)</p>", unsafe_allow_html=True)
-                    st.sidebar.info(f"Last Close (Alpha Vantage): ${historical_price:.2f} on {data['timestamp'].iloc[-1].strftime('%Y-%m-%d')}")
-            else:
-                # Use historical price if real-time not available
-                st.sidebar.info(f"Last Price (Historical): ${historical_price:.2f}")
+            st.markdown(f"""
+            <div class="data-source-info">
+            ℹ️ <b>Latest Data Source:</b> {source_text}
+            </div>
+            """, unsafe_allow_html=True)
             
-            # Calculate indicators with updated price if available
+            # Calculate indicators with the comprehensive data
             with st.spinner("Calculating indicators..."):
                 data_with_indicators = calculate_indicators(data)
             
@@ -1710,18 +1856,15 @@ def show_dashboard():
         st.subheader("Signal Analysis")
         
         if not data.empty:
-            # Generate signal using data with updated real-time price
+            # Generate signal using comprehensive data
             signal = generate_signals(data_with_indicators, selected_timeframe)
             
-            # Store real-time price information
-            last_price = quote['c'] if quote and 'c' in quote else historical_price
+            # Get current price information
+            current_price = data.loc[data.index[-1], 'close']
             
             if signal and 'direction' in signal:
                 # Add price data to signal
-                signal['last_price'] = last_price
-                signal['historical_price'] = historical_price
-                if quote and 'c' in quote:
-                    signal['price_diff_pct'] = ((quote['c'] - historical_price) / historical_price) * 100
+                signal['last_price'] = current_price
                 
                 # Display signal with appropriate styling
                 if signal['direction'] == 'BUY':
@@ -1731,12 +1874,12 @@ def show_dashboard():
                 else:
                     st.markdown(f"<p class='neutral-signal'>⚪ NEUTRAL - {signal['confidence']}% Confidence</p>", unsafe_allow_html=True)
                 
-                # Display price comparison warning if significant difference
-                if quote and 'c' in quote and abs(signal.get('price_diff_pct', 0)) > 1.0:
+                # Display data source warning if needed
+                if data_source != 'realtime':
                     st.markdown(f"""
                     <div class="price-warning">
-                    ⚠️ <b>Price Alert:</b> Current price (${quote['c']:.2f}) differs from historical close (${historical_price:.2f}) 
-                    by {signal['price_diff_pct']:.2f}%. Signal may be affected.
+                    ⚠️ <b>Data Source Note:</b> Current analysis is based on {source_text.lower()}. 
+                    Signal accuracy may improve with real-time price updates during market hours.
                     </div>
                     """, unsafe_allow_html=True)
                 
@@ -1751,8 +1894,8 @@ def show_dashboard():
                 
                 # Option to execute as paper trade
                 if st.button("Execute as Paper Trade"):
-                    shares = execute_paper_trade(symbol, signal['direction'], last_price, signal['confidence'], signal['timeframe'])
-                    st.success(f"Paper trade executed: {signal['direction']} {shares} shares of {symbol} at ${last_price:.2f}")
+                    shares = execute_paper_trade(symbol, signal['direction'], current_price, signal['confidence'], signal['timeframe'])
+                    st.success(f"Paper trade executed: {signal['direction']} {shares} shares of {symbol} at ${current_price:.2f}")
                 
                 # Display signal breakdown with timeframes
                 if st.checkbox("Show detailed signal breakdown"):
@@ -1771,21 +1914,14 @@ def show_dashboard():
                             st.markdown(f"<span style='color:orange'>• NEUTRAL: {s['reason']}{timeframe_info} (+{s['points']} points)</span>", unsafe_allow_html=True)
                 
                 # Display latest price data
-                latest = data.iloc[-1]
                 st.subheader("Latest Price Data:")
-                st.write(f"Open: ${latest['open']:.2f}")
-                st.write(f"High: ${latest['high']:.2f}")
-                st.write(f"Low: ${latest['low']:.2f}")
-                
-                # Show both historical and real-time close if available
-                if quote and 'c' in quote:
-                    st.write(f"Close (Historical): ${historical_price:.2f}")
-                    st.write(f"Current Price: ${quote['c']:.2f}")
-                else:
-                    st.write(f"Close: ${latest['close']:.2f}")
-                
-                st.write(f"Volume: {int(latest['volume']):,}")
-                st.write(f"Date: {latest['timestamp'].strftime('%Y-%m-%d')}")
+                st.write(f"Open: ${data.iloc[-1]['open']:.2f}")
+                st.write(f"High: ${data.iloc[-1]['high']:.2f}")
+                st.write(f"Low: ${data.iloc[-1]['low']:.2f}")
+                st.write(f"Close: ${data.iloc[-1]['close']:.2f}")
+                st.write(f"Volume: {int(data.iloc[-1]['volume']):,}")
+                st.write(f"Date: {data.iloc[-1]['timestamp'].strftime('%Y-%m-%d %H:%M')}")
+                st.write(f"Data Source: {source_text}")
                 
                 # Display key indicator values
                 st.subheader("Key Indicators:")
@@ -1833,7 +1969,7 @@ def show_dashboard():
 
 # Scanner page
 def show_scanner():
-    st.title("🔍 Stock Signal Scanner")
+    st.title("🔍 Enhanced Stock Signal Scanner")
     
     # Initialize paper trading
     initialize_paper_trading()
@@ -1874,8 +2010,8 @@ def show_scanner():
         ["All", "Buy Only", "Sell Only"]
     )
     
-    # Real-time price options
-    use_real_time = st.sidebar.checkbox("Use Real-time Prices", value=True)
+    # Data completeness options
+    use_comprehensive_data = st.sidebar.checkbox("Use Comprehensive Data", value=True, help="Combines daily, intraday, and real-time data for more accurate signals")
     
     # Stocks to scan
     stocks_to_scan = []
@@ -1938,7 +2074,7 @@ def show_scanner():
         if st.button("Run Scan"):
             with st.spinner(f"Scanning for {timeframe} signals... (This may take a few minutes due to API rate limits)"):
                 # Use enhanced signal generation with real-time prices if requested
-                if use_real_time:
+                if use_comprehensive_data:
                     signals = generate_enhanced_signals(stocks_to_scan, min_confidence, selected_timeframe)
                 else:
                     signals = scan_for_signals(stocks_to_scan, min_confidence, selected_timeframe)
@@ -1977,13 +2113,14 @@ def show_scanner():
                     signal_data = []
                     for signal in signals:
                         timeframe_str = signal.get('timeframe', 'Medium-term')
+                        data_source = signal.get('data_source', 'unknown')
                         
-                        # Add real-time vs historical price info if available
+                        # Build price display with source info
                         price_display = f"${signal['last_price']:.2f}"
-                        if 'historical_price' in signal and 'price_diff_pct' in signal:
-                            price_diff = abs(signal['price_diff_pct'])
-                            if price_diff > 1.0:  # If difference is significant
-                                price_display += f" (Δ {signal['price_diff_pct']:.1f}%)"
+                        if 'prev_close' in signal and 'price_diff_pct' in signal:
+                            price_diff = signal['price_diff_pct']
+                            if abs(price_diff) > 1.0:  # If difference is significant
+                                price_display += f" (Δ {price_diff:.1f}%)"
                         
                         signal_data.append({
                             'Symbol': signal['symbol'],
@@ -1991,6 +2128,7 @@ def show_scanner():
                             'Confidence': f"{signal['confidence']}%",
                             'Last Price': price_display,
                             'Timeframe': timeframe_str,
+                            'Data Source': data_source,
                             'Time': signal['timestamp']
                         })
                     
@@ -2009,11 +2147,26 @@ def show_scanner():
                             ### 🔴 SELL - {signal['symbol']} - {signal['confidence']}% Confidence
                             """)
                         
+                        # Display data source information
+                        data_source = signal.get('data_source', 'unknown')
+                        source_display = {
+                            'daily': 'Historical Daily Data',
+                            'intraday': 'Intraday Data',
+                            'intraday_aggregated': 'Aggregated Intraday Data',
+                            'realtime': 'Real-time Price'
+                        }
+                        source_text = source_display.get(data_source, data_source)
+                        st.markdown(f"""
+                        <div class="data-source-info">
+                        ℹ️ <b>Data Source:</b> {source_text}
+                        </div>
+                        """, unsafe_allow_html=True)
+                        
                         # Display price comparison warning if significant difference
-                        if 'historical_price' in signal and 'price_diff_pct' in signal and abs(signal['price_diff_pct']) > 1.0:
+                        if 'prev_close' in signal and 'price_diff_pct' in signal and abs(signal['price_diff_pct']) > 1.0:
                             st.markdown(f"""
                             <div class="price-warning">
-                            ⚠️ <b>Price Alert:</b> Current price (${signal['last_price']:.2f}) differs from historical close (${signal['historical_price']:.2f}) 
+                            ⚠️ <b>Price Movement:</b> Current price (${signal['last_price']:.2f}) differs from previous close (${signal['prev_close']:.2f}) 
                             by {signal['price_diff_pct']:.2f}%. {signal.get('confidence_adjustment', '')} confidence.
                             </div>
                             """, unsafe_allow_html=True)
@@ -2023,11 +2176,9 @@ def show_scanner():
                             st.markdown(f"<div class='timeframe-info'>✅ <b>Recommended holding period:</b> {signal['timeframe']}</div>", unsafe_allow_html=True)
                         
                         # Display price information
-                        if 'historical_price' in signal:
-                            st.write(f"Current Price: ${signal['last_price']:.2f}")
-                            st.write(f"Historical Close: ${signal['historical_price']:.2f} on {signal.get('historical_date', 'last trading day')}")
-                        else:
-                            st.write(f"Current Price: ${signal['last_price']:.2f}")
+                        st.write(f"Current Price: ${signal['last_price']:.2f}")
+                        if 'prev_close' in signal:
+                            st.write(f"Previous Close: ${signal['prev_close']:.2f} on {signal.get('prev_date', 'previous trading day')}")
                         
                         # Display reasons
                         st.subheader("Signal Reasons:")
@@ -2198,7 +2349,7 @@ def show_real_time_monitor():
 
 # Documentation page
 def show_documentation():
-    st.title("📚 Technical Trading Signal System")
+    st.title("📚 Enhanced Technical Trading Signal System")
     
     st.markdown("""
     This dashboard analyzes stocks using technical indicators to generate trading signals with confidence scores and recommended timeframes.
@@ -2208,17 +2359,42 @@ def show_documentation():
         st.markdown("""
         ### System Architecture
         
-        Our technical analysis system uses a hybrid data approach:
+        Our enhanced technical analysis system uses a comprehensive data approach:
         
-        1. **Historical Data**: From Alpha Vantage API (free tier, 5 calls/minute)
-        2. **Real-time Data**: From Finnhub API (websocket for live trades)
-        3. **Technical Analysis**: 8 key indicators to generate signals
-        4. **Signal Confidence**: Weighted scoring system (50-95%)
-        5. **Timeframe Analysis**: Categorizes optimal holding periods
-        6. **Paper Trading**: Virtual portfolio to test signals without real money
-        7. **Price Verification**: Compares historical closing prices with real-time data
+        1. **Historical Daily Data**: From Alpha Vantage API for previous trading days
+        2. **Intraday Data**: From Alpha Vantage API for the current trading day
+        3. **Real-time Data**: From Finnhub API for up-to-the-minute price updates
+        4. **Technical Analysis**: 8 key indicators to generate signals
+        5. **Signal Confidence**: Weighted scoring system (50-95%)
+        6. **Timeframe Analysis**: Categorizes optimal holding periods
+        7. **Paper Trading**: Virtual portfolio to test signals without real money
+        8. **Data Integration**: Seamless combination of all data sources for accurate analysis
         
         The system requires a minimum 65% confidence score to display trading signals.
+        """)
+    
+    with st.expander("📊 Data Integration Approach"):
+        st.markdown("""
+        ### Comprehensive Data Integration
+        
+        Our enhanced system now uses a three-tier approach to ensure complete data coverage:
+        
+        1. **Historical Daily Data (Alpha Vantage)**
+           - Provides end-of-day OHLCV data for previous trading days
+           - Used for long-term trend analysis and historical context
+           - Daily bars going back 30-200 days depending on timeframe
+        
+        2. **Intraday Data (Alpha Vantage)**
+           - Fills the critical gap between the previous day's close and current time
+           - Provides price action for the current trading day
+           - 15-minute interval data used to create a daily composite for today
+        
+        3. **Real-time Price Updates (Finnhub)**
+           - Provides the most current price for up-to-the-second accuracy
+           - Used to update the latest close price in the dataset
+           - Enables trading decisions based on the most current market conditions
+        
+        This three-tier approach ensures there are no gaps in your data, leading to more accurate technical indicators and signal generation.
         """)
     
     with st.expander("⏱️ Trading Timeframes"):
@@ -2306,34 +2482,30 @@ def show_documentation():
         You can execute trades manually from the dashboard or scanner, or set it to automatically execute new signals.
         """)
         
-    with st.expander("🔄 Real-time Price Integration"):
+    with st.expander("🔄 Real-time Data Integration"):
         st.markdown("""
-        ### Hybrid Data Approach
+        ### Seamless Data Integration
         
-        The system uses a combination of data sources to maximize accuracy:
+        The system now offers seamless integration between data sources:
         
-        - **Alpha Vantage**: Used for historical price data and indicator calculations
-        - **Finnhub**: Used for real-time price updates and trade execution pricing
+        - **Historical** → **Intraday** → **Real-time**: Data flows naturally between timeframes
+        - **Source Tracking**: Each price point is tagged with its data source
+        - **Confidence Adjustment**: Signal confidence is adjusted based on data recency and source
+        - **Price Movement Analysis**: Significant price moves between data sources are highlighted
+        - **Visualization**: Comprehensive chart integrating all data sources
         
-        When generating signals, the system:
-        
-        1. Calculates indicators using historical data
-        2. Updates the most recent price with real-time data
-        3. Adjusts the signal confidence if there's a significant price difference
-        4. Flags signals where current and historical prices differ significantly
-        
-        This approach ensures signals are based on accurate technical analysis while using the most current prices for trade execution.
+        This approach ensures technical indicators are always calculated with the most complete dataset available.
         """)
     
     with st.expander("📘 API Usage Information"):
         st.markdown("""
         ### API Limitations & Best Practices
         
-        #### Alpha Vantage (Historical Data)
+        #### Alpha Vantage (Historical & Intraday Data)
         - Free tier limit: 5 API calls per minute, 500 per day
-        - Used for: Historical price data, daily OHLC data
-        - Premium tier available for higher limits
-        - **API Key Management**: The system can now generate and manage Alpha Vantage API keys when needed
+        - Used for: Historical price data, daily OHLCV data, intraday data
+        - Intraday data is updated at the end of each trading day in the free tier
+        - Premium tier available for higher limits and real-time intraday data
         
         #### Finnhub (Real-time Data)
         - Free tier includes: Websocket access for real-time trades
@@ -2345,6 +2517,7 @@ def show_documentation():
         - Allow 60 seconds between scans to respect API limits
         - Use the dashboard for detailed analysis of individual stocks
         - Use scanner sparingly to find potential opportunities
+        - Save API calls by using cached data when possible
         """)
     
     with st.expander("🏆 Best Practices for Trading"):
@@ -2364,6 +2537,8 @@ def show_documentation():
         5. **Risk Management**: Always use stop-losses (typically 5-7% for swing trades)
         
         6. **Price Verification**: Check that real-time prices confirm historical data analysis
+        
+        7. **Data Source Awareness**: Be mindful of which data source is being used for analysis
         
         #### Risk Management Guidelines
         
@@ -2395,7 +2570,7 @@ def show_documentation():
         st.markdown("""
         ### Auto-Refresh Features
         
-        The application now includes multiple auto-refresh options to keep your data current:
+        The application includes multiple auto-refresh options to keep your data current:
         
         1. **Dashboard Refresh**: Options to refresh every 1 minute, 5 minutes, or 25 minutes
         
@@ -2405,6 +2580,25 @@ def show_documentation():
         
         The 25-minute refresh option is particularly useful for managing API rate limits with Alpha Vantage,
         as it allows you to refresh just before the hourly quota resets.
+        """)
+        
+    with st.expander("🔁 Recent Improvements"):
+        st.markdown("""
+        ### New Enhancements
+        
+        The latest version includes these key improvements:
+        
+        1. **Complete Data Integration**: Added intraday data from Alpha Vantage to bridge the gap between historical and real-time data
+        
+        2. **Data Source Tracking**: Each price point is now tagged with its source for transparency
+        
+        3. **Enhanced Visualizations**: Charts now include all data sources seamlessly integrated
+        
+        4. **Improved Signal Accuracy**: Technical indicators now calculate with complete data for better signals
+        
+        5. **Comprehensive Scanner**: The stock scanner now uses all available data sources for more accurate signals
+        
+        6. **Extended Documentation**: Added detailed information about the data integration approach
         """)
 
 if __name__ == "__main__":
