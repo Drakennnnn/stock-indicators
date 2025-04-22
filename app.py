@@ -31,7 +31,7 @@ st.set_page_config(
 
 # API keys - initialize at the module level
 FINNHUB_API_KEY = "d03bkkpr01qvvb93ems0d03bkkpr01qvvb93emsg"  # For real-time data
-ALPHA_VANTAGE_API_KEY = "BY8DWVP73ZRGRGWO"  # For historical data
+ALPHA_VANTAGE_API_KEY = "SDOOH70UR19JH1L5"  # For historical data
 
 # Data persistence functions
 def save_paper_trading_data():
