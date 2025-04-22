@@ -25,7 +25,7 @@ st.set_page_config(
 
 # API keys
 FINNHUB_API_KEY = "d03bkkpr01qvvb93ems0d03bkkpr01qvvb93emsg"  # For real-time data
-ALPHA_VANTAGE_API_KEY = "1RHT7V8ZVC83DPYD"  # For historical data
+ALPHA_VANTAGE_API_KEY = "0I7EULOLI2DW2UPW"  # For historical data
 
 # Initialize Finnhub client for real-time data
 finnhub_client = finnhub.Client(api_key=FINNHUB_API_KEY)
@@ -50,6 +50,19 @@ TIMEFRAMES = {
 # Initialize session state for stock universe if not exists
 if 'stock_universe' not in st.session_state:
     st.session_state.stock_universe = None
+
+# Initialize paper trading session state
+def initialize_paper_trading():
+    if 'paper_portfolio' not in st.session_state:
+        st.session_state.paper_portfolio = {
+            'cash': 100000,  # Starting with $100k
+            'positions': {},  # Will store {symbol: {'shares': qty, 'entry_price': price, 'entry_time': time, 'signal_confidence': conf}}
+            'trade_history': [],  # Will store closed trades
+            'performance': {'total_return': 0, 'win_rate': 0, 'trades': 0}
+        }
+    
+    if 'last_signals' not in st.session_state:
+        st.session_state.last_signals = []  # Store last scanned signals to avoid duplicates
 
 # Initialize websocket connection for real-time data
 def init_websocket():
@@ -688,6 +701,187 @@ def generate_signals(df, preferred_timeframe="short"):
         st.error(f"Error generating signals: {e}")
         return None
 
+# Paper trading functions
+def execute_paper_trade(symbol, direction, price, confidence, timeframe):
+    portfolio = st.session_state.paper_portfolio
+    positions = portfolio['positions']
+    
+    # Calculate trade size based on confidence (higher confidence = larger position)
+    # Use 2% of portfolio for 70% confidence, scale up to 5% for 95% confidence
+    position_size_pct = 0.02 + (confidence - 70) / 25 * 0.03 if confidence >= 70 else 0.02
+    position_size_pct = min(position_size_pct, 0.05)  # Cap at 5%
+    
+    trade_value = portfolio['cash'] * position_size_pct
+    shares = int(trade_value / price)
+    
+    # If shares is 0, use at least 1 share
+    shares = max(shares, 1)
+    
+    # Execute the trade
+    if direction == 'BUY':
+        # Check if we already have a position in this stock
+        if symbol in positions:
+            # If we have a SELL position, close it (fully or partially)
+            if positions[symbol]['direction'] == 'SELL':
+                # Close position
+                close_paper_trade(symbol, price, "Signal Reversal")
+            else:
+                # Add to existing position
+                current_shares = positions[symbol]['shares']
+                current_value = current_shares * positions[symbol]['entry_price']
+                new_value = shares * price
+                total_value = current_value + new_value
+                total_shares = current_shares + shares
+                # Calculate new average entry price
+                positions[symbol]['entry_price'] = total_value / total_shares
+                positions[symbol]['shares'] = total_shares
+                portfolio['cash'] -= shares * price
+        else:
+            # Open new position
+            positions[symbol] = {
+                'shares': shares,
+                'entry_price': price,
+                'entry_time': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                'direction': 'BUY',
+                'signal_confidence': confidence,
+                'timeframe': timeframe
+            }
+            portfolio['cash'] -= shares * price
+    
+    elif direction == 'SELL':
+        # For simplicity, let's assume we can short stocks
+        if symbol in positions:
+            # If we have a BUY position, close it
+            if positions[symbol]['direction'] == 'BUY':
+                # Close position
+                close_paper_trade(symbol, price, "Signal Reversal")
+            else:
+                # Add to existing short position
+                current_shares = positions[symbol]['shares']
+                current_value = current_shares * positions[symbol]['entry_price']
+                new_value = shares * price
+                total_value = current_value + new_value
+                total_shares = current_shares + shares
+                # Calculate new average entry price
+                positions[symbol]['entry_price'] = total_value / total_shares
+                positions[symbol]['shares'] = total_shares
+                portfolio['cash'] += shares * price  # Add cash for short selling
+        else:
+            # Open new short position
+            positions[symbol] = {
+                'shares': shares,
+                'entry_price': price,
+                'entry_time': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                'direction': 'SELL',
+                'signal_confidence': confidence,
+                'timeframe': timeframe
+            }
+            portfolio['cash'] += shares * price  # Add cash for short selling
+    
+    return shares
+
+# Function to close paper trades
+def close_paper_trade(symbol, current_price, reason="Manual"):
+    portfolio = st.session_state.paper_portfolio
+    positions = portfolio['positions']
+    
+    if symbol in positions:
+        position = positions[symbol]
+        shares = position['shares']
+        
+        # Calculate P&L
+        if position['direction'] == 'BUY':
+            pnl = (current_price - position['entry_price']) * shares
+        else:  # SELL/SHORT
+            pnl = (position['entry_price'] - current_price) * shares
+        
+        pnl_pct = (pnl / (position['entry_price'] * shares)) * 100
+        
+        # Update cash
+        if position['direction'] == 'BUY':
+            portfolio['cash'] += shares * current_price
+        else:  # SELL/SHORT
+            portfolio['cash'] -= shares * current_price
+        
+        # Record trade in history
+        trade_record = {
+            'symbol': symbol,
+            'direction': position['direction'],
+            'shares': shares,
+            'entry_price': position['entry_price'],
+            'exit_price': current_price,
+            'entry_time': position['entry_time'],
+            'exit_time': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            'pnl': pnl,
+            'pnl_pct': pnl_pct,
+            'reason': reason,
+            'confidence': position['signal_confidence'],
+            'timeframe': position.get('timeframe', 'Unknown')
+        }
+        
+        portfolio['trade_history'].append(trade_record)
+        
+        # Update performance metrics
+        portfolio['performance']['trades'] += 1
+        portfolio['performance']['total_return'] += pnl
+        
+        # Calculate win rate
+        winning_trades = sum(1 for trade in portfolio['trade_history'] if trade['pnl'] > 0)
+        total_trades = len(portfolio['trade_history'])
+        portfolio['performance']['win_rate'] = (winning_trades / total_trades) * 100 if total_trades > 0 else 0
+        
+        # Remove position
+        del positions[symbol]
+        
+        return pnl, pnl_pct
+    
+    return 0, 0
+
+# Function to update paper trading positions with real-time prices
+def update_paper_positions(quotes_data=None):
+    """Update all positions with latest price data"""
+    if not quotes_data:
+        # If no quotes_data provided, try to get current quotes for all positions
+        quotes_data = {}
+        for symbol in st.session_state.paper_portfolio['positions']:
+            quote = get_current_quote(symbol)
+            if quote and 'c' in quote:
+                quotes_data[symbol] = quote['c']
+    else:
+        # Convert quotes_data from DataFrame to dict for easier lookups
+        if isinstance(quotes_data, pd.DataFrame):
+            quotes_dict = {}
+            for _, row in quotes_data.iterrows():
+                quotes_dict[row['Symbol']] = row['Price']
+            quotes_data = quotes_dict
+    
+    portfolio = st.session_state.paper_portfolio
+    positions = portfolio['positions']
+    
+    # Calculate current values and P&L
+    current_portfolio_value = portfolio['cash']
+    for symbol, position in positions.items():
+        if symbol in quotes_data:
+            current_price = quotes_data[symbol]
+            # Calculate P&L for this position
+            if position['direction'] == 'BUY':
+                position['current_price'] = current_price
+                position['pnl'] = (current_price - position['entry_price']) * position['shares']
+                position['pnl_pct'] = ((current_price / position['entry_price']) - 1) * 100
+                current_portfolio_value += position['shares'] * current_price
+            else:  # SELL/SHORT
+                position['current_price'] = current_price
+                position['pnl'] = (position['entry_price'] - current_price) * position['shares']
+                position['pnl_pct'] = ((position['entry_price'] / current_price) - 1) * 100
+                current_portfolio_value -= position['shares'] * current_price
+    
+    # Calculate overall portfolio P&L
+    portfolio['current_value'] = current_portfolio_value
+    portfolio['pnl'] = current_portfolio_value - 100000  # Compared to starting value
+    portfolio['pnl_pct'] = (portfolio['pnl'] / 100000) * 100
+    
+    return portfolio
+
 # Plot chart with indicators
 def plot_chart(df, symbol):
     if df.empty or len(df) < 20:
@@ -963,6 +1157,159 @@ def setup_real_time_monitoring(symbols):
         else:
             st.info("Waiting for real-time trade data...")
 
+# Paper Trading Page
+def show_paper_trading():
+    st.title("📝 Paper Trading Portfolio")
+    
+    # Initialize paper trading
+    initialize_paper_trading()
+    
+    # Sidebar options
+    st.sidebar.header("Paper Trading Settings")
+    
+    # Add reset portfolio button
+    if st.sidebar.button("Reset Portfolio"):
+        st.session_state.paper_portfolio = {
+            'cash': 100000,
+            'positions': {},
+            'trade_history': [],
+            'performance': {'total_return': 0, 'win_rate': 0, 'trades': 0}
+        }
+        st.sidebar.success("Portfolio reset to $100,000")
+    
+    # Option to execute trades from last scanner results
+    if 'last_signals' in st.session_state and st.session_state.last_signals:
+        signals_count = len(st.session_state.last_signals)
+        if st.sidebar.button(f"Execute Last {signals_count} Scanner Signals"):
+            for signal in st.session_state.last_signals:
+                symbol = signal['symbol']
+                direction = signal['direction']
+                price = signal['last_price']
+                confidence = signal['confidence']
+                timeframe = signal.get('timeframe', 'Medium-term')
+                
+                # Execute the paper trade
+                shares = execute_paper_trade(symbol, direction, price, confidence, timeframe)
+                
+                st.sidebar.info(f"Executed: {direction} {shares} shares of {symbol} at ${price:.2f}")
+    
+    # Main area - Summary
+    col1, col2, col3 = st.columns(3)
+    
+    # Get latest prices and update positions
+    portfolio = update_paper_positions()
+    
+    with col1:
+        st.metric("Cash Balance", f"${portfolio['cash']:.2f}")
+    
+    with col2:
+        st.metric("Portfolio Value", f"${portfolio.get('current_value', 0):.2f}")
+    
+    with col3:
+        pnl = portfolio.get('pnl', 0)
+        pnl_pct = portfolio.get('pnl_pct', 0)
+        st.metric("Total P&L", f"${pnl:.2f} ({pnl_pct:.2f}%)", delta=f"{pnl_pct:.2f}%")
+    
+    # Open positions
+    st.subheader("Open Positions")
+    
+    if not portfolio['positions']:
+        st.info("No open positions. Execute trades from the Scanner page or add positions manually.")
+    else:
+        positions_data = []
+        for symbol, position in portfolio['positions'].items():
+            positions_data.append({
+                'Symbol': symbol,
+                'Direction': position['direction'],
+                'Shares': position['shares'],
+                'Entry Price': f"${position['entry_price']:.2f}",
+                'Current Price': f"${position.get('current_price', position['entry_price']):.2f}",
+                'Entry Date': position['entry_time'],
+                'P&L': f"${position.get('pnl', 0):.2f}",
+                'P&L %': f"{position.get('pnl_pct', 0):.2f}%",
+                'Confidence': f"{position.get('signal_confidence', 0)}%",
+                'Timeframe': position.get('timeframe', 'Unknown')
+            })
+        
+        df_positions = pd.DataFrame(positions_data)
+        
+        # Style the P&L columns
+        def color_pnl(val):
+            if 'P&L' in val or 'P&L %' in val:
+                try:
+                    if '%' in val:
+                        val_num = float(val.strip('%'))
+                    else:
+                        val_num = float(val.strip('$'))
+                    
+                    color = 'green' if val_num > 0 else 'red' if val_num < 0 else 'black'
+                    return f'color: {color}'
+                except:
+                    return ''
+            return ''
+        
+        # Display positions table with styling
+        st.dataframe(df_positions.style.applymap(color_pnl), use_container_width=True)
+        
+        # Add close position buttons
+        selected_position = st.selectbox("Select position to close:", list(portfolio['positions'].keys()))
+        
+        if st.button(f"Close {selected_position} Position"):
+            position = portfolio['positions'][selected_position]
+            current_price = position.get('current_price', position['entry_price'])
+            pnl, pnl_pct = close_paper_trade(selected_position, current_price)
+            
+            st.success(f"Closed {selected_position} position with P&L: ${pnl:.2f} ({pnl_pct:.2f}%)")
+            st.rerun()  # Refresh the page
+    
+    # Trade history
+    st.subheader("Trade History")
+    
+    if not portfolio['trade_history']:
+        st.info("No closed trades yet.")
+    else:
+        history_data = []
+        for trade in portfolio['trade_history']:
+            history_data.append({
+                'Symbol': trade['symbol'],
+                'Direction': trade['direction'],
+                'Shares': trade['shares'],
+                'Entry Price': f"${trade['entry_price']:.2f}",
+                'Exit Price': f"${trade['exit_price']:.2f}",
+                'Entry Time': trade['entry_time'],
+                'Exit Time': trade['exit_time'],
+                'P&L': f"${trade['pnl']:.2f}",
+                'P&L %': f"{trade['pnl_pct']:.2f}%",
+                'Confidence': f"{trade.get('confidence', 0)}%",
+                'Reason': trade['reason']
+            })
+        
+        df_history = pd.DataFrame(history_data)
+        st.dataframe(df_history.style.applymap(color_pnl), use_container_width=True)
+    
+    # Performance metrics
+    st.subheader("Performance Metrics")
+    
+    metrics_col1, metrics_col2, metrics_col3 = st.columns(3)
+    
+    with metrics_col1:
+        st.metric("Total Trades", portfolio['performance']['trades'])
+    
+    with metrics_col2:
+        st.metric("Win Rate", f"{portfolio['performance']['win_rate']:.2f}%")
+    
+    with metrics_col3:
+        avg_return = 0
+        if portfolio['performance']['trades'] > 0:
+            avg_return = portfolio['performance']['total_return'] / portfolio['performance']['trades']
+        st.metric("Average Return Per Trade", f"${avg_return:.2f}")
+    
+    # Add auto-refresh option
+    auto_refresh = st.checkbox("Auto-refresh portfolio", value=True)
+    if auto_refresh:
+        time.sleep(5)  # Refresh every 5 seconds
+        st.rerun()
+
 # App navigation
 def main():
     # First check API keys
@@ -976,6 +1323,9 @@ def main():
     
     # Initialize stock universe
     load_stock_universe()
+    
+    # Initialize paper trading
+    initialize_paper_trading()
     
     # Custom CSS for better styling
     st.markdown("""
@@ -1017,7 +1367,7 @@ def main():
     
     # Sidebar navigation
     st.sidebar.title("Navigation")
-    page = st.sidebar.radio("Go to", ["Dashboard", "Stock Scanner", "Real-time Monitor", "Documentation"])
+    page = st.sidebar.radio("Go to", ["Dashboard", "Stock Scanner", "Paper Trading", "Real-time Monitor", "Documentation"])
     
     # Display note about APIs
     st.sidebar.markdown("""
@@ -1033,6 +1383,8 @@ def main():
         show_dashboard()
     elif page == "Stock Scanner":
         show_scanner()
+    elif page == "Paper Trading":
+        show_paper_trading()
     elif page == "Real-time Monitor":
         show_real_time_monitor()
     elif page == "Documentation":
@@ -1147,6 +1499,11 @@ def show_dashboard():
                 for reason in signal['reasons']:
                     st.write(f"• {reason}")
                 
+                # Option to execute as paper trade
+                if st.button("Execute as Paper Trade"):
+                    shares = execute_paper_trade(symbol, signal['direction'], data['close'].iloc[-1], signal['confidence'], signal['timeframe'])
+                    st.success(f"Paper trade executed: {signal['direction']} {shares} shares of {symbol} at ${data['close'].iloc[-1]:.2f}")
+                
                 # Display signal breakdown with timeframes
                 if st.checkbox("Show detailed signal breakdown"):
                     st.subheader("Signal Breakdown:")
@@ -1212,6 +1569,9 @@ def show_dashboard():
 # Scanner page
 def show_scanner():
     st.title("🔍 Stock Signal Scanner")
+    
+    # Initialize paper trading
+    initialize_paper_trading()
     
     # Settings
     st.sidebar.header("Scanner Settings")
@@ -1318,7 +1678,26 @@ def show_scanner():
                     signals = [s for s in signals if s['direction'] == 'SELL']
                 
                 if signals:
+                    # Store signals in session state
+                    st.session_state.last_signals = signals
+                    
                     st.success(f"Found {len(signals)} signals!")
+                    
+                    # Option to auto-execute paper trades
+                    auto_execute = st.checkbox("Auto-execute these signals as paper trades", value=False)
+                    
+                    if auto_execute:
+                        for signal in signals:
+                            symbol = signal['symbol']
+                            direction = signal['direction']
+                            price = signal['last_price']
+                            confidence = signal['confidence']
+                            timeframe = signal.get('timeframe', 'Medium-term')
+                            
+                            # Execute the paper trade
+                            shares = execute_paper_trade(symbol, direction, price, confidence, timeframe)
+                            
+                            st.success(f"Paper trade executed: {direction} {shares} shares of {symbol} at ${price:.2f}")
                     
                     # Display signals in a table first (summary)
                     signal_data = []
@@ -1359,6 +1738,17 @@ def show_scanner():
                         # Display reasons
                         for reason in signal['reasons']:
                             st.write(f"• {reason}")
+                        
+                        # Add button to execute individual trade
+                        if st.button(f"Execute {signal['direction']} for {signal['symbol']}", key=f"btn_{signal['symbol']}"):
+                            shares = execute_paper_trade(
+                                signal['symbol'], 
+                                signal['direction'],
+                                signal['last_price'],
+                                signal['confidence'],
+                                signal.get('timeframe', 'Medium-term')
+                            )
+                            st.success(f"Paper trade executed: {signal['direction']} {shares} shares of {signal['symbol']} at ${signal['last_price']:.2f}")
                         
                         # Add a separator between signals
                         if i < len(signals):
@@ -1402,6 +1792,9 @@ def show_real_time_monitor():
             except:
                 pass
             st.session_state.ws_running = False
+    
+    # Monitor paper trading positions too
+    show_paper_positions = st.sidebar.checkbox("Show Paper Trading Positions", value=True)
     
     # Set up real-time monitoring
     setup_real_time_monitoring(monitoring_symbols)
@@ -1451,6 +1844,35 @@ def show_real_time_monitor():
         
         # Apply styling and display
         st.dataframe(df_quotes.style.applymap(color_change, subset=['Change', 'Change %']), use_container_width=True)
+        
+        # Update paper trading positions
+        if show_paper_positions and st.session_state.paper_portfolio['positions']:
+            st.subheader("Paper Trading Positions")
+            
+            # Convert quotes_data to dict for update_paper_positions
+            quotes_dict = {row['Symbol']: row['Price'] for row in quotes_data}
+            
+            # Update positions with latest prices
+            portfolio = update_paper_positions(quotes_dict)
+            
+            # Display paper positions
+            positions_data = []
+            for symbol, position in portfolio['positions'].items():
+                positions_data.append({
+                    'Symbol': symbol,
+                    'Direction': position['direction'],
+                    'Shares': position['shares'],
+                    'Entry Price': f"${position['entry_price']:.2f}",
+                    'Current Price': f"${position.get('current_price', position['entry_price']):.2f}",
+                    'P&L': f"${position.get('pnl', 0):.2f}",
+                    'P&L %': f"{position.get('pnl_pct', 0):.2f}%"
+                })
+            
+            if positions_data:
+                df_positions = pd.DataFrame(positions_data)
+                st.dataframe(df_positions.style.applymap(color_change, subset=['P&L', 'P&L %']), use_container_width=True)
+            else:
+                st.info("No open paper trading positions")
     
     # Add auto-refresh option
     auto_refresh = st.checkbox("Auto-refresh quotes", value=True)
@@ -1477,6 +1899,7 @@ def show_documentation():
         3. **Technical Analysis**: 8 key indicators to generate signals
         4. **Signal Confidence**: Weighted scoring system (50-95%)
         5. **Timeframe Analysis**: Categorizes optimal holding periods
+        6. **Paper Trading**: Virtual portfolio to test signals without real money
         
         The system requires a minimum 65% confidence score to display trading signals.
         """)
@@ -1550,32 +1973,19 @@ def show_documentation():
         **Optimal timeframe**: Long-term (1-3 months)
         """)
     
-    with st.expander("🔢 Signal Generation System"):
+    with st.expander("📝 Paper Trading System"):
         st.markdown("""
-        ### Confidence Score Calculation
+        ### Paper Trading Features
         
-        The system uses a point-based algorithm:
+        The paper trading system allows you to test trading signals in a risk-free environment:
         
-        **Starting Base**: 50 points
+        - **Starting Capital**: $100,000 virtual money
+        - **Position Sizing**: Based on signal confidence (2-5% of portfolio)
+        - **Real-time P&L**: Updated continuously using market data
+        - **Trade History**: Records all closed positions with performance metrics
+        - **Performance Analytics**: Win rate, average return, total P&L
         
-        **Signal Strength**:
-        - MACD Crossover: +15 points
-        - EMA alignments: +10 points each
-        - RSI conditions: +10 points
-        - Bollinger Band signals: +10 points
-        - Volume confirmation: +10 points
-        - ADX trend strength: +10 points
-        - Stochastic RSI signals: +5 points
-        
-        **Final Score**: Capped at 95% confidence
-        
-        ### Trading Signal Classification
-        
-        - **BUY Signals**: Generated when bullish indicators outweigh bearish ones
-        - **SELL Signals**: Generated when bearish indicators outweigh bullish ones
-        - **NEUTRAL**: When there's no clear direction or confidence is below threshold
-        
-        The recommended timeframe is determined by the strongest contributing signals.
+        You can execute trades manually from the dashboard or scanner, or set it to automatically execute new signals.
         """)
     
     with st.expander("📘 API Usage Information"):
