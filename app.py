@@ -25,7 +25,7 @@ st.set_page_config(
 
 # API keys
 FINNHUB_API_KEY = "d03bkkpr01qvvb93ems0d03bkkpr01qvvb93emsg"  # For real-time data
-ALPHA_VANTAGE_API_KEY = "CO8WA0SJB46RERSK"  # For historical data
+ALPHA_VANTAGE_API_KEY = "0I7EULOLI2DW2UPW"  # For historical data
 
 # Initialize Finnhub client for real-time data
 finnhub_client = finnhub.Client(api_key=FINNHUB_API_KEY)
@@ -701,6 +701,85 @@ def generate_signals(df, preferred_timeframe="short"):
         st.error(f"Error generating signals: {e}")
         return None
 
+# Enhanced signal generation with real-time price updates
+def generate_enhanced_signals(stocks, min_confidence=65, timeframe="short"):
+    all_signals = []
+    progress_bar = st.progress(0)
+    
+    for i, symbol in enumerate(stocks):
+        try:
+            # Update progress
+            progress_bar.progress((i + 1) / len(stocks))
+            
+            # Add delay to avoid API rate limits
+            if i > 0 and i % 5 == 0:
+                time.sleep(12)
+            
+            # Step 1: Get historical data from Alpha Vantage for indicators
+            df = fetch_alpha_vantage_daily(symbol, timeframe)
+            if df.empty:
+                continue
+            
+            # Store the historical price before updating
+            historical_price = df['close'].iloc[-1]
+            historical_date = df['timestamp'].iloc[-1]
+            
+            # Step 2: Get real-time price from Finnhub
+            quote = get_current_quote(symbol)
+            if not quote or 'c' not in quote:
+                # If we can't get current quote, use historical price but mark it
+                real_time_price = historical_price
+                price_warning = True
+            else:
+                real_time_price = quote['c']
+                price_warning = False
+                
+                # Step 3: Update the last day's close price with real-time data
+                # This is crucial for any indicators that use the most recent price
+                df.loc[df.index[-1], 'close'] = real_time_price
+            
+            # Step 4: Calculate indicators with the updated data
+            df = calculate_indicators(df)
+            
+            # Step 5: Generate signal based on updated data
+            signal = generate_signals(df, timeframe)
+            
+            if signal and signal['confidence'] >= min_confidence and signal['direction'] != 'NEUTRAL':
+                # Add both prices to the signal data
+                signal['symbol'] = symbol
+                signal['timestamp'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                signal['last_price'] = real_time_price
+                signal['historical_price'] = historical_price
+                signal['historical_date'] = historical_date.strftime("%Y-%m-%d")
+                signal['price_diff_pct'] = ((real_time_price - historical_price) / historical_price) * 100
+                
+                # Adjust confidence if prices have significant difference
+                price_diff_abs = abs(signal['price_diff_pct'])
+                
+                if price_diff_abs > 2.0:  # More than 2% difference
+                    # Flag for significant price movement since last close
+                    signal['price_warning'] = True
+                    
+                    # For large moves that oppose the signal direction
+                    if (signal['direction'] == 'BUY' and real_time_price > historical_price) or \
+                       (signal['direction'] == 'SELL' and real_time_price < historical_price):
+                        # Price moved in favor of signal - reinforce confidence
+                        signal['confidence'] = min(95, signal['confidence'] + 5)
+                        signal['confidence_adjustment'] = "Increased"
+                    else:
+                        # Price moved against signal - reduce confidence
+                        signal['confidence'] = max(50, signal['confidence'] - int(price_diff_abs))
+                        signal['confidence_adjustment'] = "Decreased"
+                
+                all_signals.append(signal)
+        except Exception as e:
+            st.error(f"Error processing {symbol}: {e}")
+            continue
+    
+    # Sort by confidence score
+    all_signals.sort(key=lambda x: x['confidence'], reverse=True)
+    return all_signals
+
 # Paper trading functions
 def execute_paper_trade(symbol, direction, price, confidence, timeframe):
     portfolio = st.session_state.paper_portfolio
@@ -881,6 +960,24 @@ def update_paper_positions(quotes_data=None):
     portfolio['pnl_pct'] = (portfolio['pnl'] / 100000) * 100
     
     return portfolio
+
+# Fixed version of color_pnl function for dataframe styling
+def color_pnl(val):
+    try:
+        val_str = str(val)
+        if 'P&L' in val_str or 'P&L %' in val_str or '$' in val_str or '%' in val_str:
+            if '%' in val_str:
+                val_num = float(val_str.strip('%'))
+            elif '$' in val_str:
+                val_num = float(val_str.strip('$'))
+            else:
+                val_num = float(val)
+            
+            color = 'green' if val_num > 0 else 'red' if val_num < 0 else 'black'
+            return f'color: {color}'
+    except:
+        return ''
+    return ''
 
 # Plot chart with indicators
 def plot_chart(df, symbol):
@@ -1084,40 +1181,6 @@ def plot_chart(df, symbol):
         st.error(f"Error creating chart: {e}")
         return None
 
-# Scan for signals across multiple stocks
-def scan_for_signals(stocks, min_confidence=65, timeframe="short"):
-    all_signals = []
-    progress_bar = st.progress(0)
-    
-    for i, symbol in enumerate(stocks):
-        try:
-            # Update progress
-            progress_bar.progress((i + 1) / len(stocks))
-            
-            # Add a small delay to avoid hitting API rate limits
-            if i > 0 and i % 5 == 0:  # Alpha Vantage limit is 5 calls per minute for free tier
-                time.sleep(12)  # Wait 12 seconds between every 5 calls
-            
-            df = fetch_alpha_vantage_daily(symbol, timeframe)
-            if df.empty:
-                continue
-                
-            df = calculate_indicators(df)
-            signal = generate_signals(df, timeframe)
-            
-            if signal and signal['confidence'] >= min_confidence and signal['direction'] != 'NEUTRAL':
-                signal['symbol'] = symbol
-                signal['timestamp'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                signal['last_price'] = df['close'].iloc[-1]
-                all_signals.append(signal)
-        except Exception as e:
-            st.error(f"Error processing {symbol}: {e}")
-            continue
-    
-    # Sort by confidence score
-    all_signals.sort(key=lambda x: x['confidence'], reverse=True)
-    return all_signals
-
 # Real-time Stock Data Screen
 def setup_real_time_monitoring(symbols):
     # Initialize session state to track if websocket is running
@@ -1233,37 +1296,24 @@ def show_paper_trading():
         
         df_positions = pd.DataFrame(positions_data)
         
-        # Style the P&L columns
-        def color_pnl(val):
-            try:
-                val_str = str(val)
-                if 'P&L' in val_str or 'P&L %' in val_str or '$' in val_str or '%' in val_str:
-                    if '%' in val_str:
-                        val_num = float(val_str.strip('%'))
-                    elif '$' in val_str:
-                        val_num = float(val_str.strip('$'))
-                    else:
-                        val_num = float(val)
-
-                    color = 'green' if val_num > 0 else 'red' if val_num < 0 else 'black'
-                    return f'color: {color}'
-            except:
-                return ''
-            return ''
-
-        # The usage remains the same:
-        st.dataframe(df_positions.style.applymap(color_pnl), use_container_width=True)
+        # Apply styling and display
+        try:
+            st.dataframe(df_positions.style.applymap(color_pnl), use_container_width=True)
+        except Exception as e:
+            st.error(f"Error styling dataframe: {e}")
+            st.dataframe(df_positions, use_container_width=True)
         
         # Add close position buttons
-        selected_position = st.selectbox("Select position to close:", list(portfolio['positions'].keys()))
-        
-        if st.button(f"Close {selected_position} Position"):
-            position = portfolio['positions'][selected_position]
-            current_price = position.get('current_price', position['entry_price'])
-            pnl, pnl_pct = close_paper_trade(selected_position, current_price)
+        if len(portfolio['positions']) > 0:
+            selected_position = st.selectbox("Select position to close:", list(portfolio['positions'].keys()))
             
-            st.success(f"Closed {selected_position} position with P&L: ${pnl:.2f} ({pnl_pct:.2f}%)")
-            st.rerun()  # Refresh the page
+            if st.button(f"Close {selected_position} Position"):
+                position = portfolio['positions'][selected_position]
+                current_price = position.get('current_price', position['entry_price'])
+                pnl, pnl_pct = close_paper_trade(selected_position, current_price)
+                
+                st.success(f"Closed {selected_position} position with P&L: ${pnl:.2f} ({pnl_pct:.2f}%)")
+                st.rerun()  # Refresh the page
     
     # Trade history
     st.subheader("Trade History")
@@ -1288,7 +1338,13 @@ def show_paper_trading():
             })
         
         df_history = pd.DataFrame(history_data)
-        st.dataframe(df_history.style.applymap(color_pnl), use_container_width=True)
+        
+        # Apply styling and display
+        try:
+            st.dataframe(df_history.style.applymap(color_pnl), use_container_width=True)
+        except Exception as e:
+            st.error(f"Error styling history dataframe: {e}")
+            st.dataframe(df_history, use_container_width=True)
     
     # Performance metrics
     st.subheader("Performance Metrics")
@@ -1364,6 +1420,13 @@ def main():
         border-radius: 5px;
         margin-top: 10px;
         border-left: 5px solid #2196F3;
+    }
+    .price-warning {
+        background-color: #fff3cd;
+        padding: 10px;
+        border-radius: 5px;
+        margin-top: 10px;
+        border-left: 5px solid #ffc107;
     }
     </style>
     """, unsafe_allow_html=True)
@@ -1449,25 +1512,38 @@ def show_dashboard():
     auto_refresh = st.sidebar.checkbox("Auto Refresh Data", value=False)
     refresh_interval = st.sidebar.slider("Refresh Interval (minutes)", 1, 60, 15)
     
-    # Last price info
-    quote = get_current_quote(symbol)
-    if quote and 'c' in quote:
-        st.sidebar.success(f"Last Price: ${quote['c']:.2f}")
-        if 'pc' in quote:
-            change = quote['c'] - quote['pc']
-            change_pct = (change / quote['pc']) * 100
-            color = "green" if change >= 0 else "red"
-            st.sidebar.markdown(f"<p style='color:{color}'>Change: {change:.2f} ({change_pct:.2f}%)</p>", unsafe_allow_html=True)
-    
     # Main content area
     col1, col2 = st.columns([2, 1])
     
     with col1:
-        # Get data and calculate indicators
-        with st.spinner("Fetching data..."):
+        # Get historical data from Alpha Vantage
+        with st.spinner("Fetching historical data..."):
             data = fetch_alpha_vantage_daily(symbol, selected_timeframe)
         
         if not data.empty:
+            # Get real-time price from Finnhub
+            quote = get_current_quote(symbol)
+            historical_price = data['close'].iloc[-1]
+            
+            # Display current vs. historical price
+            if quote and 'c' in quote:
+                real_time_price = quote['c']
+                data.loc[data.index[-1], 'close'] = real_time_price  # Update last close with real-time price
+                
+                price_diff = real_time_price - historical_price
+                price_diff_pct = (price_diff / historical_price) * 100
+                
+                st.sidebar.success(f"Last Price (Finnhub): ${real_time_price:.2f}")
+                
+                if abs(price_diff_pct) > 0.5:  # If price difference is significant
+                    color = "green" if price_diff > 0 else "red"
+                    st.sidebar.markdown(f"<p style='color:{color}'>Change from last close: {price_diff:.2f} ({price_diff_pct:.2f}%)</p>", unsafe_allow_html=True)
+                    st.sidebar.info(f"Last Close (Alpha Vantage): ${historical_price:.2f} on {data['timestamp'].iloc[-1].strftime('%Y-%m-%d')}")
+            else:
+                # Use historical price if real-time not available
+                st.sidebar.info(f"Last Price (Historical): ${historical_price:.2f}")
+            
+            # Calculate indicators with updated price if available
             with st.spinner("Calculating indicators..."):
                 data_with_indicators = calculate_indicators(data)
             
@@ -1482,9 +1558,19 @@ def show_dashboard():
         st.subheader("Signal Analysis")
         
         if not data.empty:
+            # Generate signal using data with updated real-time price
             signal = generate_signals(data_with_indicators, selected_timeframe)
             
+            # Store real-time price information
+            last_price = quote['c'] if quote and 'c' in quote else historical_price
+            
             if signal and 'direction' in signal:
+                # Add price data to signal
+                signal['last_price'] = last_price
+                signal['historical_price'] = historical_price
+                if quote and 'c' in quote:
+                    signal['price_diff_pct'] = ((quote['c'] - historical_price) / historical_price) * 100
+                
                 # Display signal with appropriate styling
                 if signal['direction'] == 'BUY':
                     st.markdown(f"<p class='buy-signal'>🔵 BUY SIGNAL - {signal['confidence']}% Confidence</p>", unsafe_allow_html=True)
@@ -1492,6 +1578,15 @@ def show_dashboard():
                     st.markdown(f"<p class='sell-signal'>🔴 SELL SIGNAL - {signal['confidence']}% Confidence</p>", unsafe_allow_html=True)
                 else:
                     st.markdown(f"<p class='neutral-signal'>⚪ NEUTRAL - {signal['confidence']}% Confidence</p>", unsafe_allow_html=True)
+                
+                # Display price comparison warning if significant difference
+                if quote and 'c' in quote and abs(signal.get('price_diff_pct', 0)) > 1.0:
+                    st.markdown(f"""
+                    <div class="price-warning">
+                    ⚠️ <b>Price Alert:</b> Current price (${quote['c']:.2f}) differs from historical close (${historical_price:.2f}) 
+                    by {signal['price_diff_pct']:.2f}%. Signal may be affected.
+                    </div>
+                    """, unsafe_allow_html=True)
                 
                 # Display timeframe recommendation
                 if 'timeframe' in signal:
@@ -1504,8 +1599,8 @@ def show_dashboard():
                 
                 # Option to execute as paper trade
                 if st.button("Execute as Paper Trade"):
-                    shares = execute_paper_trade(symbol, signal['direction'], data['close'].iloc[-1], signal['confidence'], signal['timeframe'])
-                    st.success(f"Paper trade executed: {signal['direction']} {shares} shares of {symbol} at ${data['close'].iloc[-1]:.2f}")
+                    shares = execute_paper_trade(symbol, signal['direction'], last_price, signal['confidence'], signal['timeframe'])
+                    st.success(f"Paper trade executed: {signal['direction']} {shares} shares of {symbol} at ${last_price:.2f}")
                 
                 # Display signal breakdown with timeframes
                 if st.checkbox("Show detailed signal breakdown"):
@@ -1529,7 +1624,14 @@ def show_dashboard():
                 st.write(f"Open: ${latest['open']:.2f}")
                 st.write(f"High: ${latest['high']:.2f}")
                 st.write(f"Low: ${latest['low']:.2f}")
-                st.write(f"Close: ${latest['close']:.2f}")
+                
+                # Show both historical and real-time close if available
+                if quote and 'c' in quote:
+                    st.write(f"Close (Historical): ${historical_price:.2f}")
+                    st.write(f"Current Price: ${quote['c']:.2f}")
+                else:
+                    st.write(f"Close: ${latest['close']:.2f}")
+                
                 st.write(f"Volume: {int(latest['volume']):,}")
                 st.write(f"Date: {latest['timestamp'].strftime('%Y-%m-%d')}")
                 
@@ -1612,6 +1714,9 @@ def show_scanner():
         ["All", "Buy Only", "Sell Only"]
     )
     
+    # Real-time price options
+    use_real_time = st.sidebar.checkbox("Use Real-time Prices", value=True)
+    
     # Stocks to scan
     stocks_to_scan = []
     
@@ -1672,7 +1777,11 @@ def show_scanner():
         # Scan button
         if st.button("Run Scan"):
             with st.spinner(f"Scanning for {timeframe} signals... (This may take a few minutes due to API rate limits)"):
-                signals = scan_for_signals(stocks_to_scan, min_confidence, selected_timeframe)
+                # Use enhanced signal generation with real-time prices if requested
+                if use_real_time:
+                    signals = generate_enhanced_signals(stocks_to_scan, min_confidence, selected_timeframe)
+                else:
+                    signals = scan_for_signals(stocks_to_scan, min_confidence, selected_timeframe)
                 
                 # Filter by direction if needed
                 if signal_direction == "Buy Only":
@@ -1706,11 +1815,19 @@ def show_scanner():
                     signal_data = []
                     for signal in signals:
                         timeframe_str = signal.get('timeframe', 'Medium-term')
+                        
+                        # Add real-time vs historical price info if available
+                        price_display = f"${signal['last_price']:.2f}"
+                        if 'historical_price' in signal and 'price_diff_pct' in signal:
+                            price_diff = abs(signal['price_diff_pct'])
+                            if price_diff > 1.0:  # If difference is significant
+                                price_display += f" (Δ {signal['price_diff_pct']:.1f}%)"
+                        
                         signal_data.append({
                             'Symbol': signal['symbol'],
                             'Direction': signal['direction'],
                             'Confidence': f"{signal['confidence']}%",
-                            'Last Price': f"${signal['last_price']:.2f}" if 'last_price' in signal else "N/A",
+                            'Last Price': price_display,
                             'Timeframe': timeframe_str,
                             'Time': signal['timestamp']
                         })
@@ -1730,15 +1847,28 @@ def show_scanner():
                             ### 🔴 SELL - {signal['symbol']} - {signal['confidence']}% Confidence
                             """)
                         
+                        # Display price comparison warning if significant difference
+                        if 'historical_price' in signal and 'price_diff_pct' in signal and abs(signal['price_diff_pct']) > 1.0:
+                            st.markdown(f"""
+                            <div class="price-warning">
+                            ⚠️ <b>Price Alert:</b> Current price (${signal['last_price']:.2f}) differs from historical close (${signal['historical_price']:.2f}) 
+                            by {signal['price_diff_pct']:.2f}%. {signal.get('confidence_adjustment', '')} confidence.
+                            </div>
+                            """, unsafe_allow_html=True)
+                        
                         # Display recommended timeframe
                         if 'timeframe' in signal:
                             st.markdown(f"<div class='timeframe-info'>✅ <b>Recommended holding period:</b> {signal['timeframe']}</div>", unsafe_allow_html=True)
                         
-                        # Display current price if available
-                        if 'last_price' in signal:
+                        # Display price information
+                        if 'historical_price' in signal:
+                            st.write(f"Current Price: ${signal['last_price']:.2f}")
+                            st.write(f"Historical Close: ${signal['historical_price']:.2f} on {signal.get('historical_date', 'last trading day')}")
+                        else:
                             st.write(f"Current Price: ${signal['last_price']:.2f}")
                         
                         # Display reasons
+                        st.subheader("Signal Reasons:")
                         for reason in signal['reasons']:
                             st.write(f"• {reason}")
                         
@@ -1834,19 +1964,24 @@ def show_real_time_monitor():
         # Style the DataFrame with colors for positive/negative changes
         def color_change(val):
             try:
-                if isinstance(val, str) and '%' in val:
-                    val_num = float(val.strip('%'))
+                val_str = str(val)
+                if '%' in val_str:
+                    val_num = float(val_str.strip('%'))
                     color = 'green' if val_num >= 0 else 'red'
+                    return f'color: {color}'
                 elif isinstance(val, (int, float)):
                     color = 'green' if val >= 0 else 'red'
-                else:
-                    return ''
-                return f'color: {color}'
+                    return f'color: {color}'
             except:
                 return ''
+            return ''
         
         # Apply styling and display
-        st.dataframe(df_quotes.style.applymap(color_change, subset=['Change', 'Change %']), use_container_width=True)
+        try:
+            st.dataframe(df_quotes.style.applymap(color_change, subset=['Change', 'Change %']), use_container_width=True)
+        except Exception as e:
+            st.error(f"Error styling dataframe: {e}")
+            st.dataframe(df_quotes, use_container_width=True)
         
         # Update paper trading positions
         if show_paper_positions and st.session_state.paper_portfolio['positions']:
@@ -1873,7 +2008,11 @@ def show_real_time_monitor():
             
             if positions_data:
                 df_positions = pd.DataFrame(positions_data)
-                st.dataframe(df_positions.style.applymap(color_change, subset=['P&L', 'P&L %']), use_container_width=True)
+                try:
+                    st.dataframe(df_positions.style.applymap(color_pnl), use_container_width=True)
+                except Exception as e:
+                    st.error(f"Error styling positions dataframe: {e}")
+                    st.dataframe(df_positions, use_container_width=True)
             else:
                 st.info("No open paper trading positions")
     
@@ -1903,6 +2042,7 @@ def show_documentation():
         4. **Signal Confidence**: Weighted scoring system (50-95%)
         5. **Timeframe Analysis**: Categorizes optimal holding periods
         6. **Paper Trading**: Virtual portfolio to test signals without real money
+        7. **Price Verification**: Compares historical closing prices with real-time data
         
         The system requires a minimum 65% confidence score to display trading signals.
         """)
@@ -1990,6 +2130,25 @@ def show_documentation():
         
         You can execute trades manually from the dashboard or scanner, or set it to automatically execute new signals.
         """)
+        
+    with st.expander("🔄 Real-time Price Integration"):
+        st.markdown("""
+        ### Hybrid Data Approach
+        
+        The system uses a combination of data sources to maximize accuracy:
+        
+        - **Alpha Vantage**: Used for historical price data and indicator calculations
+        - **Finnhub**: Used for real-time price updates and trade execution pricing
+        
+        When generating signals, the system:
+        
+        1. Calculates indicators using historical data
+        2. Updates the most recent price with real-time data
+        3. Adjusts the signal confidence if there's a significant price difference
+        4. Flags signals where current and historical prices differ significantly
+        
+        This approach ensures signals are based on accurate technical analysis while using the most current prices for trade execution.
+        """)
     
     with st.expander("📘 API Usage Information"):
         st.markdown("""
@@ -2027,6 +2186,8 @@ def show_documentation():
         4. **Volume Confirmation**: Ensure signals are supported by above-average volume
         
         5. **Risk Management**: Always use stop-losses (typically 5-7% for swing trades)
+        
+        6. **Price Verification**: Check that real-time prices confirm historical data analysis
         
         #### Risk Management Guidelines
         
