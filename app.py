@@ -29,6 +29,10 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+# API keys - initialize at the module level
+FINNHUB_API_KEY = "d03bkkpr01qvvb93ems0d03bkkpr01qvvb93emsg"  # For real-time data
+ALPHA_VANTAGE_API_KEY = "BY8DWVP73ZRGRGWO"  # For historical data
+
 # Data persistence functions
 def save_paper_trading_data():
     """Save paper trading data to disk"""
@@ -68,6 +72,9 @@ def load_paper_trading_data():
 # Function to generate Alpha Vantage API key automatically
 def generate_alpha_vantage_key():
     """Generate a new Alpha Vantage API key via web scraping"""
+    # Declare global variable at the beginning of the function
+    global ALPHA_VANTAGE_API_KEY
+    
     try:
         # URL for Alpha Vantage key generation
         url = "https://www.alphavantage.co/support/#api-key"
@@ -117,8 +124,7 @@ def generate_alpha_vantage_key():
                         # Store in session state
                         st.session_state.alpha_vantage_key = new_key
                         
-                        # Also update the global variable
-                        global ALPHA_VANTAGE_API_KEY
+                        # Update the global variable (already declared at function start)
                         ALPHA_VANTAGE_API_KEY = new_key
                         
                         # Save the key
@@ -129,7 +135,6 @@ def generate_alpha_vantage_key():
             # Fallback: Use a demo key for simulated success (for testing only)
             fallback_key = ''.join(random.choices(string.ascii_uppercase + string.digits, k=16))
             st.session_state.alpha_vantage_key = fallback_key
-            global ALPHA_VANTAGE_API_KEY
             ALPHA_VANTAGE_API_KEY = fallback_key
             save_api_keys()
             return fallback_key
@@ -147,7 +152,7 @@ def save_api_keys():
     try:
         keys_to_save = {
             'alpha_vantage': st.session_state.get('alpha_vantage_key', ALPHA_VANTAGE_API_KEY),
-            'finnhub': st.session_state.get('finnhub_key', FINNHUB_API_KEY)
+            'finnhub': FINNHUB_API_KEY  # Always use the constant value
         }
         
         with open('api_keys.json', 'w') as f:
@@ -160,14 +165,15 @@ def save_api_keys():
 # Function to load API keys from disk
 def load_api_keys():
     """Load API keys from disk"""
+    global ALPHA_VANTAGE_API_KEY  # Declare global at function start
+    
     try:
         if os.path.exists('api_keys.json'):
             with open('api_keys.json', 'r') as f:
                 keys = json.load(f)
                 if 'alpha_vantage' in keys:
                     st.session_state.alpha_vantage_key = keys['alpha_vantage']
-                if 'finnhub' in keys:
-                    st.session_state.finnhub_key = keys['finnhub']
+                    ALPHA_VANTAGE_API_KEY = keys['alpha_vantage']
             return True
         return False
     except Exception as e:
@@ -176,10 +182,6 @@ def load_api_keys():
 
 # Load API keys if available
 load_api_keys()
-
-# API keys
-FINNHUB_API_KEY = st.session_state.get('finnhub_key', "d03bkkpr01qvvb93ems0d03bkkpr01qvvb93emsg")  # For real-time data
-ALPHA_VANTAGE_API_KEY = st.session_state.get('alpha_vantage_key', "BY8DWVP73ZRGRGWO")  # For historical data
 
 # Initialize Finnhub client for real-time data
 finnhub_client = finnhub.Client(api_key=FINNHUB_API_KEY)
