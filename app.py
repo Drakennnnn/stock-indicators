@@ -1235,20 +1235,23 @@ def show_paper_trading():
         
         # Style the P&L columns
         def color_pnl(val):
-            if 'P&L' in val or 'P&L %' in val:
-                try:
-                    if '%' in val:
-                        val_num = float(val.strip('%'))
+            try:
+                val_str = str(val)
+                if 'P&L' in val_str or 'P&L %' in val_str or '$' in val_str or '%' in val_str:
+                    if '%' in val_str:
+                        val_num = float(val_str.strip('%'))
+                    elif '$' in val_str:
+                        val_num = float(val_str.strip('$'))
                     else:
-                        val_num = float(val.strip('$'))
-                    
+                        val_num = float(val)
+
                     color = 'green' if val_num > 0 else 'red' if val_num < 0 else 'black'
                     return f'color: {color}'
-                except:
-                    return ''
+            except:
+                return ''
             return ''
-        
-        # Display positions table with styling
+
+        # The usage remains the same:
         st.dataframe(df_positions.style.applymap(color_pnl), use_container_width=True)
         
         # Add close position buttons
