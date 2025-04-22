@@ -25,7 +25,7 @@ st.set_page_config(
 
 # API keys
 FINNHUB_API_KEY = "d03bkkpr01qvvb93ems0d03bkkpr01qvvb93emsg"  # For real-time data
-ALPHA_VANTAGE_API_KEY = "0I7EULOLI2DW2UPW"  # For historical data
+ALPHA_VANTAGE_API_KEY = "BY8DWVP73ZRGRGWO"  # For historical data
 
 # Initialize Finnhub client for real-time data
 finnhub_client = finnhub.Client(api_key=FINNHUB_API_KEY)
