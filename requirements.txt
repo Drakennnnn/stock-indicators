@@ -4,5 +4,7 @@ numpy
 plotly
 finnhub-python
 requests
-pytz
 websocket-client
+python-dateutil
+pytz
+beautifulsoup4
