@@ -12,10 +12,12 @@ import websocket
 import json
 import threading
 import queue
+from io import StringIO
+import csv
 
 # Set page configuration
 st.set_page_config(
-    page_title="Technical Trading Signal Dashboard",
+    page_title="Advanced Trading Signal Dashboard",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -32,7 +34,22 @@ finnhub_client = finnhub.Client(api_key=FINNHUB_API_KEY)
 ws_message_queue = queue.Queue()
 
 # Default settings
-DEFAULT_LOOKBACK_DAYS = 100  # Lookback period for historical data
+DEFAULT_LOOKBACK_DAYS = {
+    "short": 30,    # Short-term (swing trading)
+    "medium": 90,   # Medium-term
+    "long": 200     # Long-term
+}
+
+# Trading timeframe definitions
+TIMEFRAMES = {
+    "short": "Short-term (1-7 days)",
+    "medium": "Medium-term (1-4 weeks)",
+    "long": "Long-term (1-3 months)"
+}
+
+# Initialize session state for stock universe if not exists
+if 'stock_universe' not in st.session_state:
+    st.session_state.stock_universe = None
 
 # Initialize websocket connection for real-time data
 def init_websocket():
@@ -101,12 +118,92 @@ def verify_api_keys():
     
     return av_valid, fh_valid
 
+# Function to get a comprehensive list of US stocks
+@st.cache_data(ttl=86400)  # Cache for 24 hours
+def get_extended_stock_universe():
+    try:
+        # First try to get an expanded stock list from Alpha Vantage
+        url = f'https://www.alphavantage.co/query?function=LISTING_STATUS&apikey={ALPHA_VANTAGE_API_KEY}'
+        response = requests.get(url)
+        
+        if response.status_code == 200 and response.content:
+            # Parse the CSV content
+            csv_data = StringIO(response.text)
+            reader = csv.reader(csv_data)
+            next(reader)  # Skip header row
+            
+            # Filter for active US stocks only
+            us_stocks = []
+            for row in reader:
+                if len(row) >= 3 and row[2] == 'stock' and row[3] == 'United States':
+                    # Store both symbol and name
+                    us_stocks.append((row[0], row[1]))
+            
+            if len(us_stocks) > 0:
+                return us_stocks
+        
+        # Fallback to basic list if API fails
+        return get_basic_stock_universe()
+            
+    except Exception as e:
+        st.warning(f"Could not fetch extended stock list: {e}. Using default list instead.")
+        return get_basic_stock_universe()
+
+# Basic list of major US stocks as fallback
+def get_basic_stock_universe():
+    basic_stocks = [
+        ("AAPL", "Apple Inc"),
+        ("MSFT", "Microsoft Corporation"),
+        ("AMZN", "Amazon.com Inc"),
+        ("GOOGL", "Alphabet Inc Class A"),
+        ("META", "Meta Platforms Inc"),
+        ("TSLA", "Tesla Inc"),
+        ("NVDA", "NVIDIA Corporation"),
+        ("JPM", "JPMorgan Chase & Co"),
+        ("BAC", "Bank of America Corp"),
+        ("V", "Visa Inc"),
+        ("JNJ", "Johnson & Johnson"),
+        ("PG", "Procter & Gamble Co"),
+        ("UNH", "UnitedHealth Group Inc"),
+        ("HD", "Home Depot Inc"),
+        ("XOM", "Exxon Mobil Corp"),
+        ("DIS", "Walt Disney Co"),
+        ("NFLX", "Netflix Inc"),
+        ("INTC", "Intel Corporation"),
+        ("AMD", "Advanced Micro Devices Inc"),
+        ("PYPL", "PayPal Holdings Inc"),
+        ("CSCO", "Cisco Systems Inc"),
+        ("VZ", "Verizon Communications Inc"),
+        ("T", "AT&T Inc"),
+        ("CMCSA", "Comcast Corporation"),
+        ("KO", "Coca-Cola Co"),
+        ("PEP", "PepsiCo Inc"),
+        ("WMT", "Walmart Inc"),
+        ("MCD", "McDonald's Corp"),
+        ("NKE", "Nike Inc"),
+        ("SBUX", "Starbucks Corporation")
+    ]
+    return basic_stocks
+
+# Load stock universe on startup
+def load_stock_universe():
+    if st.session_state.stock_universe is None:
+        with st.spinner("Loading US stock universe..."):
+            st.session_state.stock_universe = get_extended_stock_universe()
+    return st.session_state.stock_universe
+
 # Function to fetch historical data from Alpha Vantage
 @st.cache_data(ttl=3600)  # Cache data for 1 hour
-def fetch_alpha_vantage_daily(symbol, days_back=DEFAULT_LOOKBACK_DAYS):
+def fetch_alpha_vantage_daily(symbol, timeframe="short"):
     try:
+        # Determine days back based on timeframe
+        days_back = DEFAULT_LOOKBACK_DAYS[timeframe]
+        
+        # Determine output size (compact for short-term, full for longer timeframes)
+        output_size = "compact" if timeframe == "short" else "full"
+        
         # Alpha Vantage API call for daily data
-        url = f'https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol={symbol}&outputsize=full&apikey={ALPHA_VANTAGE_API_KEY}'
+        url = f'https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol={symbol}&outputsize={output_size}&apikey={ALPHA_VANTAGE_API_KEY}'
         response = requests.get(url)
         data = response.json()
         
@@ -136,7 +233,7 @@ def fetch_alpha_vantage_daily(symbol, days_back=DEFAULT_LOOKBACK_DAYS):
         if days_back and len(df) > days_back:
             df = df.iloc[-days_back:]
         
-        # Reset index and rename it to 'timestamp' to maintain compatibility with original code
+        # Reset index and rename it to 'timestamp' to maintain compatibility
         df = df.reset_index().rename(columns={'index': 'timestamp'})
         
         return df
@@ -156,7 +253,7 @@ def get_current_quote(symbol):
 
 # Calculate all technical indicators
 def calculate_indicators(df):
-    if df.empty or len(df) < 30:  # Ensure we have enough data
+    if df.empty or len(df) < 20:  # Ensure we have enough data
         st.warning("Not enough data for reliable indicator calculation")
         return df
     
@@ -326,12 +423,49 @@ def calculate_indicators(df):
     return df
 
 # Generate trading signals
-def generate_signals(df):
-    if df.empty or len(df) < 30:
+def generate_signals(df, preferred_timeframe="short"):
+    if df.empty or len(df) < 20:
         return None
     
     signals = []
     confidence_score = 50  # Base confidence score
+    
+    # Indicator weights based on timeframe preference
+    weights = {
+        "short": {
+            "macd_crossover": 10,
+            "ema_cloud": 15,
+            "ema_trend": 5,
+            "rsi": 20,
+            "stoch_rsi": 15,
+            "bb": 15,
+            "volume": 15,
+            "adx": 5
+        },
+        "medium": {
+            "macd_crossover": 15,
+            "ema_cloud": 10,
+            "ema_trend": 10,
+            "rsi": 15,
+            "stoch_rsi": 10,
+            "bb": 10,
+            "volume": 15,
+            "adx": 15
+        },
+        "long": {
+            "macd_crossover": 15,
+            "ema_cloud": 5,
+            "ema_trend": 20,
+            "rsi": 10,
+            "stoch_rsi": 5,
+            "bb": 5,
+            "volume": 15,
+            "adx": 25
+        }
+    }
+    
+    # Use weights based on preferred timeframe
+    w = weights[preferred_timeframe]
     
     # Check last row for signals
     last_idx = -1
@@ -344,20 +478,20 @@ def generate_signals(df):
                 signals.append({
                     'type': 'BUY',
                     'reason': 'MACD Bullish Crossover',
-                    'points': 15,
-                    'timeframe': 'Medium-term (2-4 weeks)'
+                    'points': w["macd_crossover"],
+                    'timeframe': TIMEFRAMES["medium"]
                 })
-                confidence_score += 15
+                confidence_score += w["macd_crossover"]
             
             # Bearish MACD crossover
             elif df['macd_cross_down'].iloc[last_idx]:
                 signals.append({
                     'type': 'SELL',
                     'reason': 'MACD Bearish Crossover',
-                    'points': 15,
-                    'timeframe': 'Medium-term (2-4 weeks)'
+                    'points': w["macd_crossover"],
+                    'timeframe': TIMEFRAMES["medium"]
                 })
-                confidence_score += 15
+                confidence_score += w["macd_crossover"]
         
         # EMA Cloud
         if 'ema_cloud_bullish' in df.columns:
@@ -365,18 +499,18 @@ def generate_signals(df):
                 signals.append({
                     'type': 'BUY',
                     'reason': 'EMA Cloud Bullish (EMA8 > EMA21)',
-                    'points': 10,
-                    'timeframe': 'Short-term (1-2 weeks)'
+                    'points': w["ema_cloud"],
+                    'timeframe': TIMEFRAMES["short"]
                 })
-                confidence_score += 10
+                confidence_score += w["ema_cloud"]
             else:
                 signals.append({
                     'type': 'SELL',
                     'reason': 'EMA Cloud Bearish (EMA8 < EMA21)',
-                    'points': 10,
-                    'timeframe': 'Short-term (1-2 weeks)'
+                    'points': w["ema_cloud"],
+                    'timeframe': TIMEFRAMES["short"]
                 })
-                confidence_score += 10
+                confidence_score += w["ema_cloud"]
         
         # EMA50 vs EMA200 (Golden/Death Cross)
         if 'ema_trend' in df.columns:
@@ -384,18 +518,18 @@ def generate_signals(df):
                 signals.append({
                     'type': 'BUY',
                     'reason': 'Long-term Bullish Trend (EMA50 > EMA200)',
-                    'points': 10,
-                    'timeframe': 'Long-term (1-3 months)'
+                    'points': w["ema_trend"],
+                    'timeframe': TIMEFRAMES["long"]
                 })
-                confidence_score += 10
+                confidence_score += w["ema_trend"]
             else:
                 signals.append({
                     'type': 'SELL',
                     'reason': 'Long-term Bearish Trend (EMA50 < EMA200)',
-                    'points': 10,
-                    'timeframe': 'Long-term (1-3 months)'
+                    'points': w["ema_trend"],
+                    'timeframe': TIMEFRAMES["long"]
                 })
-                confidence_score += 10
+                confidence_score += w["ema_trend"]
         
         # RSI Signals
         if 'rsi' in df.columns:
@@ -404,19 +538,19 @@ def generate_signals(df):
                 signals.append({
                     'type': 'BUY',
                     'reason': 'RSI Oversold (<30)',
-                    'points': 10,
-                    'timeframe': 'Short-term (3-5 days)'
+                    'points': w["rsi"],
+                    'timeframe': TIMEFRAMES["short"]
                 })
-                confidence_score += 10
+                confidence_score += w["rsi"]
             # Overbought
             elif df['rsi'].iloc[last_idx] > 70:
                 signals.append({
                     'type': 'SELL',
                     'reason': 'RSI Overbought (>70)',
-                    'points': 10,
-                    'timeframe': 'Short-term (3-5 days)'
+                    'points': w["rsi"],
+                    'timeframe': TIMEFRAMES["short"]
                 })
-                confidence_score += 10
+                confidence_score += w["rsi"]
         
         # Stochastic RSI Signals
         if 'stoch_rsi_k' in df.columns and 'stoch_rsi_d' in df.columns:
@@ -425,37 +559,37 @@ def generate_signals(df):
                 signals.append({
                     'type': 'BUY',
                     'reason': 'Stochastic RSI Oversold (<20)',
-                    'points': 5,
-                    'timeframe': 'Very Short-term (1-3 days)'
+                    'points': w["stoch_rsi"],
+                    'timeframe': TIMEFRAMES["short"]
                 })
-                confidence_score += 5
+                confidence_score += w["stoch_rsi"]
             # Overbought
             elif df['stoch_rsi_k'].iloc[last_idx] > 80:
                 signals.append({
                     'type': 'SELL',
                     'reason': 'Stochastic RSI Overbought (>80)',
-                    'points': 5,
-                    'timeframe': 'Very Short-term (1-3 days)'
+                    'points': w["stoch_rsi"],
+                    'timeframe': TIMEFRAMES["short"]
                 })
-                confidence_score += 5
+                confidence_score += w["stoch_rsi"]
             
             # Crossover
             if df['stoch_rsi_k'].iloc[last_idx] > df['stoch_rsi_d'].iloc[last_idx] and df['stoch_rsi_k'].iloc[last_idx-1] <= df['stoch_rsi_d'].iloc[last_idx-1]:
                 signals.append({
                     'type': 'BUY',
                     'reason': 'Stochastic RSI Bullish Crossover',
-                    'points': 5,
-                    'timeframe': 'Very Short-term (1-3 days)'
+                    'points': w["stoch_rsi"] - 5,  # Slightly less weight for crossover
+                    'timeframe': TIMEFRAMES["short"]
                 })
-                confidence_score += 5
+                confidence_score += w["stoch_rsi"] - 5
             elif df['stoch_rsi_k'].iloc[last_idx] < df['stoch_rsi_d'].iloc[last_idx] and df['stoch_rsi_k'].iloc[last_idx-1] >= df['stoch_rsi_d'].iloc[last_idx-1]:
                 signals.append({
                     'type': 'SELL',
                     'reason': 'Stochastic RSI Bearish Crossover',
-                    'points': 5,
-                    'timeframe': 'Very Short-term (1-3 days)'
+                    'points': w["stoch_rsi"] - 5,  # Slightly less weight for crossover
+                    'timeframe': TIMEFRAMES["short"]
                 })
-                confidence_score += 5
+                confidence_score += w["stoch_rsi"] - 5
         
         # Bollinger Band signals
         if 'bb_pct_b' in df.columns and 'bb_width' in df.columns:
@@ -464,29 +598,29 @@ def generate_signals(df):
                 signals.append({
                     'type': 'SELL',
                     'reason': 'Price near upper Bollinger Band',
-                    'points': 10,
-                    'timeframe': 'Short-term (3-7 days)'
+                    'points': w["bb"],
+                    'timeframe': TIMEFRAMES["short"]
                 })
-                confidence_score += 10
+                confidence_score += w["bb"]
             # Price near lower band
             elif df['bb_pct_b'].iloc[last_idx] < 0.1:
                 signals.append({
                     'type': 'BUY',
                     'reason': 'Price near lower Bollinger Band',
-                    'points': 10,
-                    'timeframe': 'Short-term (3-7 days)'
+                    'points': w["bb"],
+                    'timeframe': TIMEFRAMES["short"]
                 })
-                confidence_score += 10
+                confidence_score += w["bb"]
             
             # Bollinger Band squeeze (setup for volatility breakout)
             if df['bb_width'].iloc[last_idx] < df['bb_width'].rolling(window=20).mean().iloc[last_idx] * 0.8:
                 signals.append({
                     'type': 'NEUTRAL',
                     'reason': 'Bollinger Band Squeeze (potential breakout setup)',
-                    'points': 5,
-                    'timeframe': 'Short-term (watch for breakout)'
+                    'points': w["bb"] - 5,  # Slightly less weight for squeeze
+                    'timeframe': TIMEFRAMES["short"]
                 })
-                confidence_score += 5
+                confidence_score += w["bb"] - 5
         
         # Volume confirmation
         if 'volume_z_score' in df.columns:
@@ -496,10 +630,10 @@ def generate_signals(df):
                 signals.append({
                     'type': direction,
                     'reason': 'High Volume Confirmation',
-                    'points': 10,
-                    'timeframe': 'Enhances existing signals'
+                    'points': w["volume"],
+                    'timeframe': "Enhances existing signals"
                 })
-                confidence_score += 10
+                confidence_score += w["volume"]
         
         # ADX - Strong trend
         if 'adx' in df.columns:
@@ -507,10 +641,10 @@ def generate_signals(df):
                 signals.append({
                     'type': 'NEUTRAL',
                     'reason': 'Strong Trend (ADX > 25)',
-                    'points': 10,
-                    'timeframe': 'Confirms directional signals'
+                    'points': w["adx"],
+                    'timeframe': "Confirms directional signals"
                 })
-                confidence_score += 10
+                confidence_score += w["adx"]
         
         # Determine overall signal direction and confidence
         buy_points = sum(signal['points'] for signal in signals if signal['type'] == 'BUY')
@@ -519,19 +653,8 @@ def generate_signals(df):
         # Calculate final confidence (cap at 95)
         final_confidence = min(95, confidence_score)
         
-        # Determine overall timeframe recommendation
-        all_timeframes = [s['timeframe'] for s in signals if 'timeframe' in s]
-        if not all_timeframes:
-            recommended_timeframe = "Medium-term (1-2 weeks)"
-        else:
-            if "Long-term" in " ".join(all_timeframes):
-                recommended_timeframe = "Long-term (1-3 months)"
-            elif "Medium-term" in " ".join(all_timeframes):
-                recommended_timeframe = "Medium-term (2-4 weeks)"
-            elif "Short-term" in " ".join(all_timeframes):
-                recommended_timeframe = "Short-term (3-10 days)"
-            else:
-                recommended_timeframe = "Very Short-term (1-3 days)"
+        # Determine overall timeframe recommendation based on preferred timeframe
+        recommended_timeframe = TIMEFRAMES[preferred_timeframe]
         
         # Determine overall signal
         if buy_points > sell_points and final_confidence >= 65:
@@ -767,22 +890,8 @@ def plot_chart(df, symbol):
         st.error(f"Error creating chart: {e}")
         return None
 
-# Get available US stock symbols
-def get_us_stock_universe():
-    # Default list of US stocks
-    default_stocks = [
-        "AAPL", "MSFT", "AMZN", "GOOGL", "META", 
-        "TSLA", "NVDA", "JPM", "BAC", "V", 
-        "JNJ", "PG", "UNH", "HD", "XOM",
-        "DIS", "NFLX", "INTC", "AMD", "PYPL",
-        "CSCO", "VZ", "T", "CMCSA", "KO",
-        "PEP", "WMT", "MCD", "NKE", "SBUX"
-    ]
-    
-    return default_stocks
-
 # Scan for signals across multiple stocks
-def scan_for_signals(stocks, min_confidence=65):
+def scan_for_signals(stocks, min_confidence=65, timeframe="short"):
     all_signals = []
     progress_bar = st.progress(0)
     
@@ -795,12 +904,12 @@ def scan_for_signals(stocks, min_confidence=65):
             if i > 0 and i % 5 == 0:  # Alpha Vantage limit is 5 calls per minute for free tier
                 time.sleep(12)  # Wait 12 seconds between every 5 calls
             
-            df = fetch_alpha_vantage_daily(symbol)
+            df = fetch_alpha_vantage_daily(symbol, timeframe)
             if df.empty:
                 continue
                 
             df = calculate_indicators(df)
-            signal = generate_signals(df)
+            signal = generate_signals(df, timeframe)
             
             if signal and signal['confidence'] >= min_confidence and signal['direction'] != 'NEUTRAL':
                 signal['symbol'] = symbol
@@ -865,6 +974,9 @@ def main():
     if not fh_valid:
         st.warning("Finnhub API key is invalid or has reached its limit. Real-time data may not be available.")
     
+    # Initialize stock universe
+    load_stock_universe()
+    
     # Custom CSS for better styling
     st.markdown("""
     <style>
@@ -912,7 +1024,8 @@ def main():
     <div class="api-info">
     <strong>Data Sources:</strong><br>
     - Historical data: Alpha Vantage<br>
-    - Real-time data: Finnhub
+    - Real-time data: Finnhub<br>
+    <small>Free tier: 25 API calls per day</small>
     </div>
     """, unsafe_allow_html=True)
     
@@ -932,15 +1045,50 @@ def show_dashboard():
     # Settings in sidebar
     st.sidebar.header("Dashboard Settings")
     
-    # Stock selection 
-    symbol = st.sidebar.selectbox(
-        "Stock Symbol", 
-        get_us_stock_universe(),
-        index=0  # Default to AAPL
+    # Trading timeframe selection
+    timeframe = st.sidebar.radio(
+        "Trading Timeframe",
+        ["Short-term (1-7 days)", "Medium-term (1-4 weeks)", "Long-term (1-3 months)"],
+        index=0  # Default to short-term
     )
     
-    # Days to look back
-    lookback_days = st.sidebar.slider("Days to Analyze", 50, 500, 100)
+    # Map display timeframe to internal timeframe code
+    timeframe_map = {
+        "Short-term (1-7 days)": "short",
+        "Medium-term (1-4 weeks)": "medium",
+        "Long-term (1-3 months)": "long"
+    }
+    selected_timeframe = timeframe_map[timeframe]
+    
+    # Stock selection from all available US stocks
+    stock_symbols = [s[0] for s in st.session_state.stock_universe]
+    stock_names = [f"{s[0]}: {s[1]}" for s in st.session_state.stock_universe]
+    
+    # Create a search box for stocks
+    stock_search = st.sidebar.text_input("Search for a stock symbol or name:")
+    
+    if stock_search:
+        # Filter stocks based on search
+        filtered_stocks = [(s[0], s[1]) for s in st.session_state.stock_universe 
+                          if stock_search.upper() in s[0] or stock_search.lower() in s[1].lower()]
+        
+        if not filtered_stocks:
+            st.sidebar.warning(f"No matches found for '{stock_search}'")
+            stock_options = stock_names[:30]  # Show first 30 as fallback
+        else:
+            stock_options = [f"{s[0]}: {s[1]}" for s in filtered_stocks]
+    else:
+        stock_options = stock_names[:30]  # Show first 30 by default
+    
+    # Stock selector
+    selected_stock = st.sidebar.selectbox(
+        "Select Stock",
+        options=stock_options,
+        index=0
+    )
+    
+    # Extract symbol from selection
+    symbol = selected_stock.split(":")[0].strip()
     
     # Auto refresh option
     auto_refresh = st.sidebar.checkbox("Auto Refresh Data", value=False)
@@ -962,7 +1110,7 @@ def show_dashboard():
     with col1:
         # Get data and calculate indicators
         with st.spinner("Fetching data..."):
-            data = fetch_alpha_vantage_daily(symbol, lookback_days)
+            data = fetch_alpha_vantage_daily(symbol, selected_timeframe)
         
         if not data.empty:
             with st.spinner("Calculating indicators..."):
@@ -979,7 +1127,7 @@ def show_dashboard():
         st.subheader("Signal Analysis")
         
         if not data.empty:
-            signal = generate_signals(data_with_indicators)
+            signal = generate_signals(data_with_indicators, selected_timeframe)
             
             if signal and 'direction' in signal:
                 # Display signal with appropriate styling
@@ -1068,10 +1216,25 @@ def show_scanner():
     # Settings
     st.sidebar.header("Scanner Settings")
     
+    # Trading timeframe selection
+    timeframe = st.sidebar.radio(
+        "Trading Timeframe",
+        ["Short-term (1-7 days)", "Medium-term (1-4 weeks)", "Long-term (1-3 months)"],
+        index=0  # Default to short-term
+    )
+    
+    # Map display timeframe to internal timeframe code
+    timeframe_map = {
+        "Short-term (1-7 days)": "short",
+        "Medium-term (1-4 weeks)": "medium",
+        "Long-term (1-3 months)": "long"
+    }
+    selected_timeframe = timeframe_map[timeframe]
+    
     # Choose scan mode
     scan_mode = st.sidebar.radio(
         "Scan Mode",
-        ["Quick Scan (Pre-selected)", "Custom Scan"]
+        ["Quick Scan (Top Stocks)", "Custom Scan"]
     )
     
     # Minimum confidence threshold
@@ -1089,90 +1252,127 @@ def show_scanner():
     # Stocks to scan
     stocks_to_scan = []
     
-    if scan_mode == "Quick Scan (Pre-selected)":
-        stocks_to_scan = get_us_stock_universe()[:10]  # Limit to 10 stocks to avoid API limits
-        st.write(f"Scanning {len(stocks_to_scan)} US stocks...")
-        st.warning("Alpha Vantage free tier limits: 5 API calls per minute, 500 calls per day. Scanning may take some time.")
+    if scan_mode == "Quick Scan (Top Stocks)":
+        # Get top 10 major stocks for quick scan
+        top_stocks = [s[0] for s in st.session_state.stock_universe[:10]]
+        stocks_to_scan = top_stocks
+        st.write(f"Scanning {len(stocks_to_scan)} top US stocks...")
+        st.warning("Alpha Vantage free tier limits: 25 API calls per day. Scanning will use 10 of your daily quota.")
     else:
-        # Custom stock input
-        custom_input = st.sidebar.text_area(
-            "Enter stock symbols (comma-separated)",
-            "AAPL, MSFT, AMZN, GOOGL, META"
-        )
+        # Custom stock input section
+        st.sidebar.subheader("Select Custom Stocks")
         
-        # Parse input
-        stocks_to_scan = [s.strip().upper() for s in custom_input.split(",")]
-        st.write(f"Scanning {len(stocks_to_scan)} custom stocks...")
+        # Create a search box for adding stocks
+        stock_search = st.sidebar.text_input("Search for stocks to add:")
+        
+        if stock_search:
+            # Filter stocks based on search
+            filtered_stocks = [(s[0], s[1]) for s in st.session_state.stock_universe 
+                              if stock_search.upper() in s[0] or stock_search.lower() in s[1].lower()]
+            
+            if not filtered_stocks:
+                st.sidebar.warning(f"No matches found for '{stock_search}'")
+            else:
+                options = [f"{s[0]}: {s[1]}" for s in filtered_stocks[:20]]  # Limit to 20 results
+                selected_stocks = st.sidebar.multiselect(
+                    "Select stocks to scan:",
+                    options=options
+                )
+                
+                # Extract symbols from selections
+                if selected_stocks:
+                    stocks_to_scan = [s.split(":")[0].strip() for s in selected_stocks]
+                    st.write(f"Scanning {len(stocks_to_scan)} custom stocks...")
+                    if len(stocks_to_scan) > 10:
+                        st.warning(f"Scanning {len(stocks_to_scan)} stocks will use {len(stocks_to_scan)} of your daily 25 API calls quota.")
+        
+        # Default options if no search or selection
+        if not stocks_to_scan:
+            default_options = [f"{s[0]}: {s[1]}" for s in st.session_state.stock_universe[:20]]
+            st.sidebar.write("Or select from popular stocks:")
+            selected_default = st.sidebar.multiselect(
+                "Popular stocks:",
+                options=default_options
+            )
+            
+            if selected_default:
+                stocks_to_scan = [s.split(":")[0].strip() for s in selected_default]
+                st.write(f"Scanning {len(stocks_to_scan)} stocks...")
+                if len(stocks_to_scan) > 10:
+                    st.warning(f"Scanning {len(stocks_to_scan)} stocks will use {len(stocks_to_scan)} of your daily 25 API calls quota.")
     
     # Display stock list
-    with st.expander("View stocks to scan"):
-        st.write(", ".join(stocks_to_scan))
-    
-    # Scan button
-    if st.button("Run Scan"):
-        with st.spinner("Scanning for signals... (This may take a few minutes due to API rate limits)"):
-            signals = scan_for_signals(stocks_to_scan, min_confidence)
-            
-            # Filter by direction if needed
-            if signal_direction == "Buy Only":
-                signals = [s for s in signals if s['direction'] == 'BUY']
-            elif signal_direction == "Sell Only":
-                signals = [s for s in signals if s['direction'] == 'SELL']
-            
-            if signals:
-                st.success(f"Found {len(signals)} signals!")
+    if stocks_to_scan:
+        with st.expander("View stocks to scan"):
+            st.write(", ".join(stocks_to_scan))
+        
+        # Scan button
+        if st.button("Run Scan"):
+            with st.spinner(f"Scanning for {timeframe} signals... (This may take a few minutes due to API rate limits)"):
+                signals = scan_for_signals(stocks_to_scan, min_confidence, selected_timeframe)
                 
-                # Display signals in a table first (summary)
-                signal_data = []
-                for signal in signals:
-                    timeframe = signal.get('timeframe', 'Medium-term')
-                    signal_data.append({
-                        'Symbol': signal['symbol'],
-                        'Direction': signal['direction'],
-                        'Confidence': f"{signal['confidence']}%",
-                        'Last Price': f"${signal['last_price']:.2f}" if 'last_price' in signal else "N/A",
-                        'Timeframe': timeframe,
-                        'Time': signal['timestamp']
-                    })
+                # Filter by direction if needed
+                if signal_direction == "Buy Only":
+                    signals = [s for s in signals if s['direction'] == 'BUY']
+                elif signal_direction == "Sell Only":
+                    signals = [s for s in signals if s['direction'] == 'SELL']
                 
-                df_signals = pd.DataFrame(signal_data)
-                st.dataframe(df_signals, use_container_width=True)
-                
-                # Display detailed signals
-                st.subheader("Detailed Signals")
-                for i, signal in enumerate(signals, 1):
-                    if signal['direction'] == 'BUY':
-                        st.markdown(f"""
-                        ### 🔵 BUY - {signal['symbol']} - {signal['confidence']}% Confidence
-                        """)
-                    else:
-                        st.markdown(f"""
-                        ### 🔴 SELL - {signal['symbol']} - {signal['confidence']}% Confidence
-                        """)
+                if signals:
+                    st.success(f"Found {len(signals)} signals!")
                     
-                    # Display recommended timeframe
-                    if 'timeframe' in signal:
-                        st.markdown(f"<div class='timeframe-info'>✅ <b>Recommended holding period:</b> {signal['timeframe']}</div>", unsafe_allow_html=True)
+                    # Display signals in a table first (summary)
+                    signal_data = []
+                    for signal in signals:
+                        timeframe_str = signal.get('timeframe', 'Medium-term')
+                        signal_data.append({
+                            'Symbol': signal['symbol'],
+                            'Direction': signal['direction'],
+                            'Confidence': f"{signal['confidence']}%",
+                            'Last Price': f"${signal['last_price']:.2f}" if 'last_price' in signal else "N/A",
+                            'Timeframe': timeframe_str,
+                            'Time': signal['timestamp']
+                        })
                     
-                    # Display current price if available
-                    if 'last_price' in signal:
-                        st.write(f"Current Price: ${signal['last_price']:.2f}")
+                    df_signals = pd.DataFrame(signal_data)
+                    st.dataframe(df_signals, use_container_width=True)
                     
-                    # Display reasons
-                    for reason in signal['reasons']:
-                        st.write(f"• {reason}")
+                    # Display detailed signals
+                    st.subheader("Detailed Signals")
+                    for i, signal in enumerate(signals, 1):
+                        if signal['direction'] == 'BUY':
+                            st.markdown(f"""
+                            ### 🔵 BUY - {signal['symbol']} - {signal['confidence']}% Confidence
+                            """)
+                        else:
+                            st.markdown(f"""
+                            ### 🔴 SELL - {signal['symbol']} - {signal['confidence']}% Confidence
+                            """)
+                        
+                        # Display recommended timeframe
+                        if 'timeframe' in signal:
+                            st.markdown(f"<div class='timeframe-info'>✅ <b>Recommended holding period:</b> {signal['timeframe']}</div>", unsafe_allow_html=True)
+                        
+                        # Display current price if available
+                        if 'last_price' in signal:
+                            st.write(f"Current Price: ${signal['last_price']:.2f}")
+                        
+                        # Display reasons
+                        for reason in signal['reasons']:
+                            st.write(f"• {reason}")
+                        
+                        # Add a separator between signals
+                        if i < len(signals):
+                            st.markdown("---")
                     
-                    # Add a separator between signals
-                    if i < len(signals):
-                        st.markdown("---")
-                
-                # Option to save results
-                if st.button("Save Results to CSV"):
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    df_signals.to_csv(f"signals_{timestamp}.csv", index=False)
-                    st.success(f"Saved results to signals_{timestamp}.csv")
-            else:
-                st.info("No strong signals found matching your criteria")
+                    # Option to save results
+                    if st.button("Save Results to CSV"):
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        df_signals.to_csv(f"signals_{timestamp}.csv", index=False)
+                        st.success(f"Saved results to signals_{timestamp}.csv")
+                else:
+                    st.info(f"No {timeframe} signals found matching your criteria")
+    else:
+        st.warning("Please select at least one stock to scan")
 
 # Real-time Monitor
 def show_real_time_monitor():
