@@ -16,6 +16,7 @@ from io import StringIO
 import csv
 import pickle
 import os
+from functools import partial
 
 # Set page configuration
 st.set_page_config(
@@ -35,7 +36,8 @@ def save_paper_trading_data():
     try:
         data_to_save = {
             'portfolio': st.session_state.paper_portfolio,
-            'last_signals': st.session_state.last_signals if 'last_signals' in st.session_state else []
+            'last_signals': st.session_state.last_signals if 'last_signals' in st.session_state else [],
+            'signal_performance': st.session_state.signal_performance if 'signal_performance' in st.session_state else {}
         }
         
         with open('paper_trading_data.pkl', 'wb') as f:
@@ -58,6 +60,13 @@ def load_paper_trading_data():
                     st.session_state.last_signals = data['last_signals']
                 else:
                     st.session_state.last_signals = []
+                    
+                # Load signal performance tracking data
+                if 'signal_performance' in data:
+                    st.session_state.signal_performance = data['signal_performance']
+                else:
+                    st.session_state.signal_performance = {}
+                    
             st.sidebar.success("Loaded saved trading data!")
             return True
         return False
@@ -123,6 +132,13 @@ TIMEFRAMES = {
     "long": "Long-term (1-3 months)"
 }
 
+# Multiple timeframe settings for analysis
+MULTI_TIMEFRAME_SETTINGS = {
+    "short": ["15min", "1h", "1d"],  # For short-term signals
+    "medium": ["1h", "1d", "1wk"],   # For medium-term signals
+    "long": ["1d", "1wk", "1mon"]    # For long-term signals
+}
+
 # Initialize session state for stock universe if not exists
 if 'stock_universe' not in st.session_state:
     st.session_state.stock_universe = None
@@ -142,6 +158,85 @@ def initialize_paper_trading():
     
     if 'last_signals' not in st.session_state:
         st.session_state.last_signals = []  # Store last scanned signals to avoid duplicates
+        
+    # Initialize signal performance tracking
+    if 'signal_performance' not in st.session_state:
+        st.session_state.signal_performance = {
+            'signals': {},  # Will store {signal_key: {'wins': n, 'losses': n, 'total': n, 'win_rate': x}}
+            'indicators': {},  # Will store performance by indicator
+            'patterns': {}  # Will store performance by pattern combination
+        }
+
+# ENHANCEMENT 5: Signal Performance Tracking Functions
+def update_signal_performance(signal_key, outcome):
+    """
+    Update the historical performance of a signal type
+    
+    Parameters:
+    signal_key (str): A unique identifier for this signal type
+    outcome (bool): True for win, False for loss
+    """
+    if 'signal_performance' not in st.session_state:
+        initialize_paper_trading()
+    
+    performance = st.session_state.signal_performance
+    
+    # Initialize if signal key doesn't exist
+    if signal_key not in performance['signals']:
+        performance['signals'][signal_key] = {
+            'wins': 0,
+            'losses': 0,
+            'total': 0,
+            'win_rate': 0.0
+        }
+    
+    # Update counts
+    if outcome:
+        performance['signals'][signal_key]['wins'] += 1
+    else:
+        performance['signals'][signal_key]['losses'] += 1
+        
+    performance['signals'][signal_key]['total'] += 1
+    
+    # Update win rate
+    total = performance['signals'][signal_key]['total']
+    wins = performance['signals'][signal_key]['wins']
+    performance['signals'][signal_key]['win_rate'] = (wins / total) * 100 if total > 0 else 0
+    
+    # Save updated data
+    save_paper_trading_data()
+    
+def generate_signal_key(signal):
+    """Generate a unique key for a signal based on its characteristics"""
+    # Create a key based on direction and reasons
+    if not signal or 'direction' not in signal or 'reasons' not in signal:
+        return None
+        
+    # Sort reasons to ensure consistent key generation
+    sorted_reasons = sorted(signal['reasons'])
+    reason_str = "_".join([r.replace(" ", "")[:15] for r in sorted_reasons])
+    
+    # Include market regime if available
+    regime_str = f"_{signal.get('market_regime', 'unknown')}"
+    
+    # Create the key
+    key = f"{signal['direction']}_{reason_str}{regime_str}"
+    
+    return key
+
+def get_signal_historical_performance(signal):
+    """Get the historical performance metrics for a given signal type"""
+    signal_key = generate_signal_key(signal)
+    
+    if not signal_key or 'signal_performance' not in st.session_state:
+        return None
+    
+    performance = st.session_state.signal_performance
+    
+    if signal_key in performance['signals']:
+        return performance['signals'][signal_key]
+    
+    return None
 
 # Initialize websocket connection for real-time data
 def init_websocket():
@@ -295,6 +390,144 @@ def load_stock_universe():
             st.session_state.stock_universe = get_extended_stock_universe()
     return st.session_state.stock_universe
 
+# ENHANCEMENT 1: Multi-timeframe analysis functions
+def fetch_multi_timeframe_data(symbol, timeframe_preference="short"):
+    """
+    Fetch data for multiple timeframes based on the preferred trading timeframe
+    
+    Parameters:
+    symbol (str): The stock symbol
+    timeframe_preference (str): One of "short", "medium", or "long"
+    
+    Returns:
+    dict: A dictionary with data for each timeframe
+    """
+    # Get the appropriate timeframes to fetch based on preference
+    timeframes = MULTI_TIMEFRAME_SETTINGS[timeframe_preference]
+    
+    # Initialize results dictionary
+    multi_tf_data = {}
+    
+    # Fetch data for each timeframe
+    for tf in timeframes:
+        if tf == "15min" or tf == "1h":
+            # Fetch intraday data for shorter timeframes
+            interval = "15min" if tf == "15min" else "60min"
+            data = fetch_alpha_vantage_intraday(symbol, interval=interval)
+            if not data.empty:
+                multi_tf_data[tf] = data
+        elif tf == "1d":
+            # Use the existing daily data fetch
+            data = create_comprehensive_dataset(symbol, "short")
+            if not data.empty:
+                multi_tf_data[tf] = data
+        elif tf == "1wk":
+            # Weekly data
+            data = fetch_alpha_vantage_weekly(symbol)
+            if not data.empty:
+                multi_tf_data[tf] = data
+        elif tf == "1mon":
+            # Monthly data
+            data = fetch_alpha_vantage_monthly(symbol)
+            if not data.empty:
+                multi_tf_data[tf] = data
+    
+    return multi_tf_data
+
+# Function to fetch weekly data from Alpha Vantage
+@st.cache_data(ttl=86400)  # Cache for 24 hours
+def fetch_alpha_vantage_weekly(symbol):
+    try:
+        # Alpha Vantage API call for weekly data
+        url = f'https://www.alphavantage.co/query?function=TIME_SERIES_WEEKLY&symbol={symbol}&apikey={ALPHA_VANTAGE_API_KEY}'
+        response = requests.get(url)
+        data = response.json()
+        
+        if "Weekly Time Series" not in data:
+            st.warning(f"No weekly data found for {symbol} in Alpha Vantage. Error: {data.get('Information', 'Unknown error')}")
+            return pd.DataFrame()
+        
+        # Convert to DataFrame
+        df = pd.DataFrame(data["Weekly Time Series"]).T
+        df = df.rename(columns={
+            '1. open': 'open',
+            '2. high': 'high',
+            '3. low': 'low',
+            '4. close': 'close',
+            '5. volume': 'volume'
+        })
+        
+        # Convert columns to numeric values
+        for col in df.columns:
+            df[col] = pd.to_numeric(df[col])
+        
+        # Add datetime index
+        df.index = pd.to_datetime(df.index)
+        df = df.sort_index()
+        
+        # Keep only the last 52 weeks (1 year)
+        if len(df) > 52:
+            df = df.iloc[-52:]
+        
+        # Reset index and rename it to 'timestamp' to maintain compatibility
+        df = df.reset_index().rename(columns={'index': 'timestamp'})
+        
+        # Add data source column
+        df['data_source'] = 'weekly'
+        
+        return df
+        
+    except Exception as e:
+        st.error(f"Error fetching weekly data for {symbol} from Alpha Vantage: {e}")
+        return pd.DataFrame()
+
+# Function to fetch monthly data from Alpha Vantage
+@st.cache_data(ttl=86400)  # Cache for 24 hours
+def fetch_alpha_vantage_monthly(symbol):
+    try:
+        # Alpha Vantage API call for monthly data
+        url = f'https://www.alphavantage.co/query?function=TIME_SERIES_MONTHLY&symbol={symbol}&apikey={ALPHA_VANTAGE_API_KEY}'
+        response = requests.get(url)
+        data = response.json()
+        
+        if "Monthly Time Series" not in data:
+            st.warning(f"No monthly data found for {symbol} in Alpha Vantage. Error: {data.get('Information', 'Unknown error')}")
+            return pd.DataFrame()
+        
+        # Convert to DataFrame
+        df = pd.DataFrame(data["Monthly Time Series"]).T
+        df = df.rename(columns={
+            '1. open': 'open',
+            '2. high': 'high',
+            '3. low': 'low',
+            '4. close': 'close',
+            '5. volume': 'volume'
+        })
+        
+        # Convert columns to numeric values
+        for col in df.columns:
+            df[col] = pd.to_numeric(df[col])
+        
+        # Add datetime index
+        df.index = pd.to_datetime(df.index)
+        df = df.sort_index()
+        
+        # Keep only the last 24 months (2 years)
+        if len(df) > 24:
+            df = df.iloc[-24:]
+        
+        # Reset index and rename it to 'timestamp' to maintain compatibility
+        df = df.reset_index().rename(columns={'index': 'timestamp'})
+        
+        # Add data source column
+        df['data_source'] = 'monthly'
+        
+        return df
+        
+    except Exception as e:
+        st.error(f"Error fetching monthly data for {symbol} from Alpha Vantage: {e}")
+        return pd.DataFrame()
+
 # Function to fetch historical daily data from Alpha Vantage
 @st.cache_data(ttl=3600)  # Cache data for 1 hour
 def fetch_alpha_vantage_daily(symbol, timeframe="short"):
@@ -348,7 +581,7 @@ def fetch_alpha_vantage_daily(symbol, timeframe="short"):
         st.error(f"Error fetching daily data for {symbol} from Alpha Vantage: {e}")
         return pd.DataFrame()
 
-# NEW FUNCTION: Fetch intraday data from Alpha Vantage for the current trading day
+# Fetch intraday data from Alpha Vantage for the current trading day
 @st.cache_data(ttl=300)  # Cache data for 5 minutes
 def fetch_alpha_vantage_intraday(symbol, interval='15min'):
     """
@@ -390,19 +623,16 @@ def fetch_alpha_vantage_intraday(symbol, interval='15min'):
         df.index = pd.to_datetime(df.index)
         df = df.sort_index()
         
-        # Filter for only today's data
-        today = datetime.now().date()
-        df = df[df.index.date == today]
-        
-        # If no data for today (e.g., market not open yet), return empty DataFrame
-        if df.empty:
-            return pd.DataFrame()
+        # For 15min and 1h, get a reasonable amount of history
+        lookback_days = 5 if interval == '15min' else 10 if interval == '60min' else 1
+        cutoff_date = datetime.now() - timedelta(days=lookback_days)
+        df = df[df.index >= cutoff_date]
         
         # Reset index and rename it to 'timestamp' to maintain compatibility
         df = df.reset_index().rename(columns={'index': 'timestamp'})
         
         # Add data source column
-        df['data_source'] = 'intraday'
+        df['data_source'] = f'intraday_{interval}'
         
         return df
         
@@ -419,7 +649,7 @@ def get_current_quote(symbol):
         st.warning(f"Error fetching current quote for {symbol}: {e}")
         return None
 
-# NEW FUNCTION: Create a comprehensive dataset combining daily, intraday, and real-time data
+# Create a comprehensive dataset combining daily, intraday, and real-time data
 def create_comprehensive_dataset(symbol, timeframe="short"):
     """
     Create a comprehensive dataset combining historical daily data, 
@@ -492,6 +722,94 @@ def create_comprehensive_dataset(symbol, timeframe="short"):
             combined_df.loc[last_idx, 'low'] = real_time_price
     
     return combined_df
+
+# ENHANCEMENT 3: Market Regime Detection (continued)
+def detect_market_regime(df):
+    """
+    Detect the current market regime (trending, ranging, or volatile)
+    
+    Parameters:
+    df (pd.DataFrame): DataFrame with price data and indicators
+    
+    Returns:
+    str: The detected market regime - 'trending', 'ranging', or 'volatile'
+    dict: Additional metrics about the regime detection
+    """
+    if df.empty or len(df) < 20:
+        return "unknown", {}
+    
+    # Make a copy to avoid SettingWithCopyWarning
+    df = df.copy()
+    
+    # Ensure ADX is calculated
+    if 'adx' not in df.columns:
+        # If we don't have ADX, calculate it
+        # For simplicity, we'll use the existing calculate_indicators function
+        df = calculate_indicators(df)
+    
+    # Get the last 20 bars for regime detection
+    recent_df = df.iloc[-20:]
+    
+    # 1. Check ADX for trend strength
+    adx_value = recent_df['adx'].iloc[-1]
+    
+    # 2. Check Bollinger Band width for volatility/ranging
+    if 'bb_width' not in recent_df.columns:
+        # Calculate if not available
+        bb_width_mean = 0.05  # Default value
+    else:
+        bb_width = recent_df['bb_width'].iloc[-1]
+        bb_width_mean = recent_df['bb_width'].mean()
+    
+    # 3. Check price movement relative to EMAs
+    if 'ema50' in recent_df.columns and 'ema200' in recent_df.columns:
+        # Calculate the angle/slope of EMA50
+        ema50_slope = (recent_df['ema50'].iloc[-1] - recent_df['ema50'].iloc[-5]) / 5
+        ema50_slope_pct = ema50_slope / recent_df['ema50'].iloc[-5] * 100
+        
+        # Check if price is consistently above/below EMAs (trend indicator)
+        price_above_ema50 = recent_df['close'] > recent_df['ema50']
+        price_above_ema200 = recent_df['close'] > recent_df['ema200']
+        consistent_trend = (price_above_ema50.sum() > 15 or price_above_ema50.sum() < 5) and \
+                           (price_above_ema200.sum() > 15 or price_above_ema200.sum() < 5)
+    else:
+        ema50_slope_pct = 0
+        consistent_trend = False
+    
+    # 4. Check price volatility
+    price_volatility = recent_df['high'].max() / recent_df['low'].min() - 1
+    daily_ranges = (recent_df['high'] - recent_df['low']) / recent_df['low']
+    avg_daily_range = daily_ranges.mean() * 100  # As percentage
+    
+    # Collect metrics for detailed analysis
+    metrics = {
+        'adx': adx_value,
+        'bb_width': bb_width if 'bb_width' in locals() else 0,
+        'bb_width_mean': bb_width_mean,
+        'ema50_slope_pct': ema50_slope_pct,
+        'consistent_trend': consistent_trend,
+        'price_volatility': price_volatility,
+        'avg_daily_range': avg_daily_range
+    }
+    
+    # Decision logic for regime classification
+    if adx_value > 25 and consistent_trend and abs(ema50_slope_pct) > 0.1:
+        # Strong trend detected
+        regime = 'trending'
+    elif bb_width < 0.7 * bb_width_mean and adx_value < 20:
+        # Tight consolidation/ranging
+        regime = 'ranging'
+    elif price_volatility > 0.08 or avg_daily_range > 3.0:
+        # High volatility
+        regime = 'volatile'
+    elif adx_value < 15:
+        # Low directional movement, likely ranging
+        regime = 'ranging'
+    else:
+        # Default to weak trend if no strong signals
+        regime = 'weak_trend'
+    
+    return regime, metrics
 
 # Calculate all technical indicators
 def calculate_indicators(df):
@@ -664,27 +982,384 @@ def calculate_indicators(df):
     
     return df
 
-# Generate trading signals
-def generate_signals(df, preferred_timeframe="short"):
+# ENHANCEMENT 1: Multi-timeframe analysis and alignment
+def calculate_multi_timeframe_alignment(multi_tf_data):
+    """
+    Calculate alignment score across multiple timeframes
+    
+    Parameters:
+    multi_tf_data (dict): Dictionary with data for multiple timeframes
+    
+    Returns:
+    dict: Metrics about alignment across timeframes
+    """
+    if not multi_tf_data or len(multi_tf_data) < 2:
+        return {
+            'alignment_score': 0,
+            'aligned': False,
+            'timeframes_analyzed': 0
+        }
+    
+    # Initialize alignment metrics
+    alignment = {
+        'ema_cloud': [],
+        'macd': [],
+        'rsi': [],
+        'price_trend': [],
+        'overall': []
+    }
+    
+    # Process each timeframe
+    for tf, df in multi_tf_data.items():
+        if df.empty or len(df) < 20:
+            continue
+            
+        # Calculate indicators if not already present
+        if 'ema8' not in df.columns:
+            df = calculate_indicators(df)
+        
+        # Get the last row for analysis
+        last_row = df.iloc[-1]
+        
+        # EMA Cloud direction (ema8 > ema21 is bullish)
+        if 'ema_cloud_bullish' in last_row:
+            alignment['ema_cloud'].append(1 if last_row['ema_cloud_bullish'] else -1)
+        
+        # MACD direction
+        if all(col in last_row for col in ['macd', 'macd_signal']):
+            alignment['macd'].append(1 if last_row['macd'] > last_row['macd_signal'] else -1)
+        
+        # RSI direction
+        if 'rsi' in last_row:
+            # Neutral zone is 40-60, bullish above, bearish below
+            rsi_value = last_row['rsi']
+            if rsi_value > 60:
+                alignment['rsi'].append(1)  # Bullish
+            elif rsi_value < 40:
+                alignment['rsi'].append(-1)  # Bearish
+            else:
+                alignment['rsi'].append(0)  # Neutral
+        
+        # Price trend (compared to ema50)
+        if 'ema50' in last_row:
+            alignment['price_trend'].append(1 if last_row['close'] > last_row['ema50'] else -1)
+    
+    # Calculate alignment scores
+    for key in alignment:
+        if key != 'overall' and alignment[key]:
+            # Check if all values are the same (either all 1 or all -1)
+            values = alignment[key]
+            if all(v == values[0] for v in values) and values[0] != 0:
+                # Perfect alignment (all bullish or all bearish)
+                alignment[key] = {'aligned': True, 'direction': 'bullish' if values[0] == 1 else 'bearish', 'score': 1.0}
+            elif sum(values) > 0 and all(v >= 0 for v in values):
+                # Mostly bullish (some neutral but no bearish)
+                alignment[key] = {'aligned': True, 'direction': 'bullish', 'score': sum(values) / len(values)}
+            elif sum(values) < 0 and all(v <= 0 for v in values):
+                # Mostly bearish (some neutral but no bullish)
+                alignment[key] = {'aligned': True, 'direction': 'bearish', 'score': -sum(values) / len(values)}
+            else:
+                # Mixed signals
+                alignment[key] = {'aligned': False, 'direction': 'mixed', 'score': 0}
+    
+    # Calculate overall alignment score
+    aligned_keys = [k for k in alignment if k != 'overall' and isinstance(alignment[k], dict) and alignment[k]['aligned']]
+    bullish_keys = [k for k in aligned_keys if alignment[k]['direction'] == 'bullish']
+    bearish_keys = [k for k in aligned_keys if alignment[k]['direction'] == 'bearish']
+    
+    # Determine overall alignment
+    if len(aligned_keys) >= 3:
+        if len(bullish_keys) >= 3:
+            overall_aligned = True
+            overall_direction = 'bullish'
+            overall_score = sum(alignment[k]['score'] for k in bullish_keys) / len(bullish_keys)
+        elif len(bearish_keys) >= 3:
+            overall_aligned = True
+            overall_direction = 'bearish'
+            overall_score = sum(alignment[k]['score'] for k in bearish_keys) / len(bearish_keys)
+        else:
+            overall_aligned = False
+            overall_direction = 'mixed'
+            overall_score = 0
+    else:
+        overall_aligned = False
+        overall_direction = 'insufficient_data'
+        overall_score = 0
+    
+    alignment['overall'] = {
+        'aligned': overall_aligned,
+        'direction': overall_direction,
+        'score': overall_score,
+        'timeframes_analyzed': len(multi_tf_data),
+        'alignment_details': {k: alignment[k] for k in alignment if k != 'overall'}
+    }
+    
+    return alignment['overall']
+
+# ENHANCEMENT 2: Signal Clarity & Conflict Resolution
+def calculate_signal_clarity(signals):
+    """
+    Calculate a signal clarity score based on agreement/disagreement among indicators
+    
+    Parameters:
+    signals (list): List of signal dictionaries with indicator signals
+    
+    Returns:
+    dict: Metrics about signal clarity and conflicts
+    """
+    if not signals:
+        return {
+            'clarity_score': 0,
+            'agreement_ratio': 0,
+            'conflicts': []
+        }
+    
+    # Count buy and sell signals
+    buy_signals = [s for s in signals if s['type'] == 'BUY']
+    sell_signals = [s for s in signals if s['type'] == 'SELL']
+    neutral_signals = [s for s in signals if s['type'] == 'NEUTRAL']
+    
+    total_directional = len(buy_signals) + len(sell_signals)
+    total_signals = len(signals)
+    
+    # No directional signals
+    if total_directional == 0:
+        return {
+            'clarity_score': 0,
+            'agreement_ratio': 0,
+            'conflicts': []
+        }
+    
+    # Calculate agreement ratio (higher is better)
+    if len(buy_signals) >= len(sell_signals):
+        majority_direction = 'BUY'
+        agreement_ratio = len(buy_signals) / total_directional
+    else:
+        majority_direction = 'SELL'
+        agreement_ratio = len(sell_signals) / total_directional
+    
+    # Calculate clarity score (0-100)
+    clarity_score = (agreement_ratio * 60) + (len(neutral_signals) / total_signals * 10)
+    
+    # Bonus for stronger agreement
+    if agreement_ratio > 0.8:
+        clarity_score += 20
+    elif agreement_ratio > 0.6:
+        clarity_score += 10
+        
+    # Cap at 100
+    clarity_score = min(100, clarity_score)
+    
+    # Identify conflicting signals
+    conflicts = []
+    if agreement_ratio < 1.0:
+        # There are some conflicting signals
+        conflicting_direction = 'SELL' if majority_direction == 'BUY' else 'BUY'
+        conflicting_signals = sell_signals if majority_direction == 'BUY' else buy_signals
+        
+        for signal in conflicting_signals:
+            conflicts.append({
+                'reason': signal['reason'],
+                'points': signal['points'],
+                'direction': signal['type']
+            })
+    
+    return {
+        'clarity_score': clarity_score,
+        'agreement_ratio': agreement_ratio,
+        'majority_direction': majority_direction,
+        'conflicts': conflicts
+    }
+
+# ENHANCEMENT 4: Entry timing signals detection
+def detect_entry_timing_signals(df, signal_direction):
+    """
+    Detect optimal entry timing signals on shorter timeframes
+    
+    Parameters:
+    df (pd.DataFrame): DataFrame with price and indicator data
+    signal_direction (str): The overall signal direction ('BUY' or 'SELL')
+    
+    Returns:
+    dict: Entry timing information
+    """
+    if df.empty or len(df) < 20:
+        return {
+            'entry_signal': False,
+            'reason': 'Insufficient data'
+        }
+    
+    # Get recent data (last 3 bars)
+    recent = df.iloc[-3:]
+    
+    entry_signals = []
+    
+    # Look for entry signals based on overall direction
+    if signal_direction == 'BUY':
+        # For BUY signals
+        
+        # 1. MACD just crossed above signal line
+        if 'macd_cross_up' in recent.columns and recent['macd_cross_up'].any():
+            entry_signals.append({
+                'type': 'bullish_macd_cross',
+                'strength': 'strong'
+            })
+        
+        # 2. RSI just bounced from oversold
+        if 'rsi' in recent.columns:
+            rsi_values = recent['rsi']
+            if rsi_values.iloc[0] < 30 and rsi_values.iloc[-1] > 35:
+                entry_signals.append({
+                    'type': 'rsi_oversold_bounce',
+                    'strength': 'strong'
+                })
+        
+        # 3. Price just crossed above EMA8
+        if 'ema8' in recent.columns:
+            price_cross_above = (recent['close'].iloc[-1] > recent['ema8'].iloc[-1]) and \
+                                (recent['close'].iloc[-2] <= recent['ema8'].iloc[-2])
+            if price_cross_above:
+                entry_signals.append({
+                    'type': 'price_cross_above_ema8',
+                    'strength': 'moderate'
+                })
+        
+        # 4. Bollinger Band bounce from lower band
+        if 'bb_lower' in recent.columns:
+            bb_bounce = (recent['close'].iloc[-2] < recent['bb_lower'].iloc[-2]) and \
+                        (recent['close'].iloc[-1] > recent['bb_lower'].iloc[-1])
+            if bb_bounce:
+                entry_signals.append({
+                    'type': 'bollinger_band_bounce',
+                    'strength': 'strong'
+                })
+        
+    elif signal_direction == 'SELL':
+        # For SELL signals
+        
+        # 1. MACD just crossed below signal line
+        if 'macd_cross_down' in recent.columns and recent['macd_cross_down'].any():
+            entry_signals.append({
+                'type': 'bearish_macd_cross',
+                'strength': 'strong'
+            })
+        
+        # 2. RSI just peaked from overbought
+        if 'rsi' in recent.columns:
+            rsi_values = recent['rsi']
+            if rsi_values.iloc[0] > 70 and rsi_values.iloc[-1] < 65:
+                entry_signals.append({
+                    'type': 'rsi_overbought_drop',
+                    'strength': 'strong'
+                })
+        
+        # 3. Price just crossed below EMA8
+        if 'ema8' in recent.columns:
+            price_cross_below = (recent['close'].iloc[-1] < recent['ema8'].iloc[-1]) and \
+                                (recent['close'].iloc[-2] >= recent['ema8'].iloc[-2])
+            if price_cross_below:
+                entry_signals.append({
+                    'type': 'price_cross_below_ema8',
+                    'strength': 'moderate'
+                })
+        
+        # 4. Bollinger Band breakdown from upper band
+        if 'bb_upper' in recent.columns:
+            bb_breakdown = (recent['close'].iloc[-2] > recent['bb_upper'].iloc[-2]) and \
+                          (recent['close'].iloc[-1] < recent['bb_upper'].iloc[-1])
+            if bb_breakdown:
+                entry_signals.append({
+                    'type': 'bollinger_band_breakdown',
+                    'strength': 'strong'
+                })
+    
+    # Return entry signal data
+    if entry_signals:
+        # Strong signals take precedence
+        strong_signals = [s for s in entry_signals if s['strength'] == 'strong']
+        if strong_signals:
+            best_signal = strong_signals[0]
+        else:
+            best_signal = entry_signals[0]
+            
+        return {
+            'entry_signal': True,
+            'signal_type': best_signal['type'],
+            'strength': best_signal['strength'],
+            'all_signals': entry_signals
+        }
+    else:
+        return {
+            'entry_signal': False,
+            'reason': 'No immediate entry signals detected'
+        }
+
+# Generate trading signals (continued)
+def generate_signals(df, preferred_timeframe="short", multi_timeframe_data=None):
+    """
+    Enhanced signal generation with multi-timeframe analysis, regime detection,
+    signal clarity and conflict resolution
+    
+    Parameters:
+    df (pd.DataFrame): DataFrame with price and indicator data
+    preferred_timeframe (str): Preferred trading timeframe
+    multi_timeframe_data (dict): Optional dictionary with data for multiple timeframes
+    
+    Returns:
+    dict: Signal information with enhanced contextual awareness
+    """
     if df.empty or len(df) < 20:
         return None
     
     signals = []
     confidence_score = 50  # Base confidence score
     
-    # Indicator weights based on timeframe preference
+    # ENHANCEMENT 3: Detect market regime
+    market_regime, regime_metrics = detect_market_regime(df)
+    
+    # Adjust indicator weights based on market regime and timeframe preference
     weights = {
-        "short": {
-            "macd_crossover": 10,
+        "trending": {
+            "macd_crossover": 15,
             "ema_cloud": 15,
+            "ema_trend": 20,
+            "rsi": 10,
+            "stoch_rsi": 5,
+            "bb": 5,
+            "volume": 15,
+            "adx": 15
+        },
+        "ranging": {
+            "macd_crossover": 5,
+            "ema_cloud": 5,
             "ema_trend": 5,
-            "rsi": 20,
+            "rsi": 25,
+            "stoch_rsi": 20,
+            "bb": 25,
+            "volume": 10,
+            "adx": 5
+        },
+        "volatile": {
+            "macd_crossover": 10,
+            "ema_cloud": 10,
+            "ema_trend": 10,
+            "rsi": 15,
             "stoch_rsi": 15,
             "bb": 15,
+            "volume": 20,
+            "adx": 5
+        },
+        "weak_trend": {
+            "macd_crossover": 15,
+            "ema_cloud": 15,
+            "ema_trend": 10,
+            "rsi": 15,
+            "stoch_rsi": 15,
+            "bb": 10,
             "volume": 15,
             "adx": 5
         },
-        "medium": {
+        "unknown": {
             "macd_crossover": 15,
             "ema_cloud": 10,
             "ema_trend": 10,
@@ -693,21 +1368,11 @@ def generate_signals(df, preferred_timeframe="short"):
             "bb": 10,
             "volume": 15,
             "adx": 15
-        },
-        "long": {
-            "macd_crossover": 15,
-            "ema_cloud": 5,
-            "ema_trend": 20,
-            "rsi": 10,
-            "stoch_rsi": 5,
-            "bb": 5,
-            "volume": 15,
-            "adx": 25
         }
     }
     
-    # Use weights based on preferred timeframe
-    w = weights[preferred_timeframe]
+    # Use weights based on detected market regime
+    w = weights[market_regime]
     
     # Check last row for signals
     last_idx = -1
@@ -888,32 +1553,116 @@ def generate_signals(df, preferred_timeframe="short"):
                 })
                 confidence_score += w["adx"]
         
-        # Determine overall signal direction and confidence
+        # ENHANCEMENT 2: Calculate signal clarity score
+        signal_clarity = calculate_signal_clarity(signals)
+        
+        # ENHANCEMENT 1: Apply multi-timeframe alignment boost if available
+        multi_timeframe_alignment = None
+        if multi_timeframe_data and len(multi_timeframe_data) >= 2:
+            multi_timeframe_alignment = calculate_multi_timeframe_alignment(multi_timeframe_data)
+            
+            # Boost confidence if timeframes align
+            if multi_timeframe_alignment['aligned']:
+                alignment_boost = multi_timeframe_alignment['score'] * 10  # 0-10 point boost
+                confidence_score += alignment_boost
+                
+                # Add a reason for the alignment
+                signals.append({
+                    'type': 'BUY' if multi_timeframe_alignment['direction'] == 'bullish' else 'SELL',
+                    'reason': f"Multi-timeframe alignment ({multi_timeframe_alignment['timeframes_analyzed']} timeframes)",
+                    'points': alignment_boost,
+                    'timeframe': "All analyzed timeframes"
+                })
+        
+        # Apply signal clarity adjustment to confidence
+        if signal_clarity['clarity_score'] > 75:
+            # High clarity - boost confidence
+            clarity_boost = (signal_clarity['clarity_score'] - 75) / 5  # Up to 5 points boost
+            confidence_score += clarity_boost
+        elif signal_clarity['clarity_score'] < 40:
+            # Low clarity - reduce confidence
+            clarity_penalty = (40 - signal_clarity['clarity_score']) / 4  # Up to 10 points penalty
+            confidence_score -= clarity_penalty
+            
+        # ENHANCEMENT 5: Apply historical performance adjustment if available
+        signal_key = None
+        historical_performance = None
+        
+        # Determine overall signal direction for historical lookup
         buy_points = sum(signal['points'] for signal in signals if signal['type'] == 'BUY')
         sell_points = sum(signal['points'] for signal in signals if signal['type'] == 'SELL')
         
+        if buy_points > sell_points:
+            preliminary_direction = 'BUY'
+        elif sell_points > buy_points:
+            preliminary_direction = 'SELL'
+        else:
+            preliminary_direction = 'NEUTRAL'
+            
+        # Create a temporary signal for historical lookup
+        temp_signal = {
+            'direction': preliminary_direction,
+            'reasons': [s['reason'] for s in signals if s['type'] == preliminary_direction or s['type'] == 'NEUTRAL'],
+            'market_regime': market_regime
+        }
+        
+        signal_key = generate_signal_key(temp_signal)
+        if signal_key:
+            historical_performance = get_signal_historical_performance(temp_signal)
+            
+            if historical_performance and historical_performance['total'] >= 5:
+                # We have enough history to make an adjustment
+                win_rate = historical_performance['win_rate']
+                
+                if win_rate > 60:
+                    # Above average win rate - boost confidence
+                    perf_boost = (win_rate - 60) / 4  # Up to 10 points boost for excellent win rates
+                    confidence_score += perf_boost
+                elif win_rate < 40:
+                    # Below average win rate - reduce confidence
+                    perf_penalty = (40 - win_rate) / 4  # Up to 10 points penalty
+                    confidence_score -= perf_penalty
+        
         # Calculate final confidence (cap at 95)
-        final_confidence = min(95, confidence_score)
+        final_confidence = min(95, max(5, confidence_score))
         
         # Determine overall timeframe recommendation based on preferred timeframe
         recommended_timeframe = TIMEFRAMES[preferred_timeframe]
         
         # Determine overall signal
-        if buy_points > sell_points and final_confidence >= 65:
+        if buy_points > sell_points and final_confidence >= 60:
+            # ENHANCEMENT 4: Check for entry timing signals
+            entry_signal = detect_entry_timing_signals(df, 'BUY')
+            
             overall_signal = {
                 'direction': 'BUY',
                 'confidence': final_confidence,
                 'signals': signals,
                 'reasons': [s['reason'] for s in signals if s['type'] == 'BUY' or s['type'] == 'NEUTRAL'],
-                'timeframe': recommended_timeframe
+                'timeframe': recommended_timeframe,
+                'market_regime': market_regime,
+                'regime_metrics': regime_metrics,
+                'signal_clarity': signal_clarity,
+                'entry_signals': entry_signal,
+                'multi_timeframe_alignment': multi_timeframe_alignment,
+                'historical_performance': historical_performance
             }
-        elif sell_points > buy_points and final_confidence >= 65:
+        elif sell_points > buy_points and final_confidence >= 60:
+            # ENHANCEMENT 4: Check for entry timing signals
+            entry_signal = detect_entry_timing_signals(df, 'SELL')
+            
             overall_signal = {
                 'direction': 'SELL',
                 'confidence': final_confidence,
                 'signals': signals,
                 'reasons': [s['reason'] for s in signals if s['type'] == 'SELL' or s['type'] == 'NEUTRAL'],
-                'timeframe': recommended_timeframe
+                'timeframe': recommended_timeframe,
+                'market_regime': market_regime,
+                'regime_metrics': regime_metrics,
+                'signal_clarity': signal_clarity,
+                'entry_signals': entry_signal,
+                'multi_timeframe_alignment': multi_timeframe_alignment,
+                'historical_performance': historical_performance
             }
         else:
             overall_signal = {
@@ -921,7 +1670,12 @@ def generate_signals(df, preferred_timeframe="short"):
                 'confidence': final_confidence,
                 'signals': signals,
                 'reasons': [s['reason'] for s in signals if s['type'] == 'NEUTRAL'],
-                'timeframe': "Wait for clearer signals"
+                'timeframe': "Wait for clearer signals",
+                'market_regime': market_regime,
+                'regime_metrics': regime_metrics,
+                'signal_clarity': signal_clarity,
+                'multi_timeframe_alignment': multi_timeframe_alignment,
+                'historical_performance': historical_performance
             }
         
         return overall_signal
@@ -944,7 +1698,10 @@ def generate_enhanced_signals(stocks, min_confidence=65, timeframe="short"):
             if i > 0 and i % 5 == 0:
                 time.sleep(12)
             
-            # Step 1: Get comprehensive data with daily, intraday, and real-time prices
+            # ENHANCEMENT 1: Fetch multi-timeframe data
+            multi_timeframe_data = fetch_multi_timeframe_data(symbol, timeframe)
+            
+            # Get comprehensive data for the primary timeframe
             df = create_comprehensive_dataset(symbol, timeframe)
             if df.empty:
                 continue
@@ -964,11 +1721,11 @@ def generate_enhanced_signals(stocks, min_confidence=65, timeframe="short"):
                 prev_close = current_price
                 prev_date = last_timestamp
             
-            # Step 4: Calculate indicators with the updated data
+            # Calculate indicators with the updated data
             df = calculate_indicators(df)
             
-            # Step 5: Generate signal based on comprehensive data
-            signal = generate_signals(df, timeframe)
+            # Generate signal with enhanced features
+            signal = generate_signals(df, timeframe, multi_timeframe_data)
             
             if signal and signal['confidence'] >= min_confidence and signal['direction'] != 'NEUTRAL':
                 # Add price and data source information to the signal data
@@ -1021,6 +1778,9 @@ def scan_for_signals(stocks, min_confidence=65, timeframe="short"):
             if i > 0 and i % 5 == 0:
                 time.sleep(12)
             
+            # ENHANCEMENT 1: Fetch multi-timeframe data for enhanced accuracy
+            multi_timeframe_data = fetch_multi_timeframe_data(symbol, timeframe)
+            
             # Get comprehensive data
             df = create_comprehensive_dataset(symbol, timeframe)
             if df.empty:
@@ -1029,8 +1789,8 @@ def scan_for_signals(stocks, min_confidence=65, timeframe="short"):
             # Calculate indicators
             df = calculate_indicators(df)
             
-            # Generate signal
-            signal = generate_signals(df, timeframe)
+            # Generate enhanced signal
+            signal = generate_signals(df, timeframe, multi_timeframe_data)
             
             if signal and signal['confidence'] >= min_confidence and signal['direction'] != 'NEUTRAL':
                 # Add symbol and price info
@@ -1094,7 +1854,8 @@ def execute_paper_trade(symbol, direction, price, confidence, timeframe):
                 'entry_time': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 'direction': 'BUY',
                 'signal_confidence': confidence,
-                'timeframe': timeframe
+                'timeframe': timeframe,
+                'signal_key': ''  # Will be filled by tracking function
             }
             portfolio['cash'] -= shares * price
     
@@ -1124,7 +1885,8 @@ def execute_paper_trade(symbol, direction, price, confidence, timeframe):
                 'entry_time': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 'direction': 'SELL',
                 'signal_confidence': confidence,
-                'timeframe': timeframe
+                'timeframe': timeframe,
+                'signal_key': ''  # Will be filled by tracking function
             }
             portfolio['cash'] += shares * price  # Add cash for short selling
     
@@ -1169,7 +1931,8 @@ def close_paper_trade(symbol, current_price, reason="Manual"):
             'pnl_pct': pnl_pct,
             'reason': reason,
             'confidence': position['signal_confidence'],
-            'timeframe': position.get('timeframe', 'Unknown')
+            'timeframe': position.get('timeframe', 'Unknown'),
+            'signal_key': position.get('signal_key', '')
         }
         
         portfolio['trade_history'].append(trade_record)
@@ -1182,6 +1945,11 @@ def close_paper_trade(symbol, current_price, reason="Manual"):
         winning_trades = sum(1 for trade in portfolio['trade_history'] if trade['pnl'] > 0)
         total_trades = len(portfolio['trade_history'])
         portfolio['performance']['win_rate'] = (winning_trades / total_trades) * 100 if total_trades > 0 else 0
+        
+        # ENHANCEMENT 5: Update signal performance tracking if we have a signal key
+        if 'signal_key' in position and position['signal_key']:
+            # Update historical performance of this signal type
+            update_signal_performance(position['signal_key'], pnl > 0)
         
         # Remove position
         del positions[symbol]
@@ -1238,7 +2006,7 @@ def update_paper_positions(quotes_data=None):
     
     return portfolio
 
-# Fixed version of color_pnl function for dataframe styling
+# Fixed version of color_pnl function for dataframe styling (continued)
 def color_pnl(val):
     try:
         val_str = str(val)
@@ -1536,6 +2304,11 @@ def show_paper_trading():
                 # Execute the paper trade
                 shares = execute_paper_trade(symbol, direction, price, confidence, timeframe)
                 
+                # ENHANCEMENT 5: Store signal key for performance tracking
+                signal_key = generate_signal_key(signal)
+                if signal_key and symbol in st.session_state.paper_portfolio['positions']:
+                    st.session_state.paper_portfolio['positions'][symbol]['signal_key'] = signal_key
+                
                 st.sidebar.info(f"Executed: {direction} {shares} shares of {symbol} at ${price:.2f}")
     
     # Main area - Summary
@@ -1645,6 +2418,32 @@ def show_paper_trading():
             avg_return = portfolio['performance']['total_return'] / portfolio['performance']['trades']
         st.metric("Average Return Per Trade", f"${avg_return:.2f}")
     
+    # ENHANCEMENT 5: Display Signal Performance Tracking
+    if 'signal_performance' in st.session_state and st.session_state.signal_performance.get('signals'):
+        st.subheader("Signal Performance Tracking")
+        
+        signal_perf = st.session_state.signal_performance['signals']
+        
+        if signal_perf:
+            signal_data = []
+            for key, data in signal_perf.items():
+                if data['total'] >= 3:  # Only show signals with sufficient data
+                    signal_data.append({
+                        'Signal Type': key[:40] + "..." if len(key) > 40 else key,
+                        'Win Rate': f"{data['win_rate']:.2f}%",
+                        'Wins': data['wins'],
+                        'Losses': data['losses'],
+                        'Total Trades': data['total']
+                    })
+            
+            if signal_data:
+                df_signals = pd.DataFrame(signal_data)
+                st.dataframe(df_signals, use_container_width=True)
+            else:
+                st.info("Not enough signal performance data accumulated yet.")
+        else:
+            st.info("No signal performance data available yet.")
+    
     # Add auto-refresh option
     refresh_options = st.radio(
         "Auto-refresh portfolio", 
@@ -1727,6 +2526,41 @@ def main():
         margin-top: 10px;
         border-left: 5px solid #4CAF50;
     }
+    .regime-info {
+        background-color: #f3e5f5;
+        padding: 10px;
+        border-radius: 5px;
+        margin-top: 10px;
+        border-left: 5px solid #9c27b0;
+    }
+    .signal-clarity-info {
+        background-color: #e3f2fd;
+        padding: 10px;
+        border-radius: 5px;
+        margin-top: 10px;
+        border-left: 5px solid #2962ff;
+    }
+    .multi-timeframe-info {
+        background-color: #fff8e1;
+        padding: 10px;
+        border-radius: 5px;
+        margin-top: 10px;
+        border-left: 5px solid #ffb300;
+    }
+    .entry-signal-info {
+        background-color: #fce4ec;
+        padding: 10px;
+        border-radius: 5px;
+        margin-top: 10px;
+        border-left: 5px solid #e91e63;
+    }
+    .historical-info {
+        background-color: #efebe9;
+        padding: 10px;
+        border-radius: 5px;
+        margin-top: 10px;
+        border-left: 5px solid #795548;
+    }
     </style>
     """, unsafe_allow_html=True)
     
@@ -1808,6 +2642,9 @@ def show_dashboard():
     # Extract symbol from selection
     symbol = selected_stock.split(":")[0].strip()
     
+    # Option to enable multi-timeframe analysis (default on)
+    use_multi_timeframe = st.sidebar.checkbox("Enable Multi-Timeframe Analysis", value=True)
+    
     # Auto refresh option
     refresh_options = st.sidebar.radio(
         "Auto Refresh Data", 
@@ -1822,6 +2659,12 @@ def show_dashboard():
         # Get comprehensive data (daily + intraday + real-time)
         with st.spinner("Fetching comprehensive data..."):
             data = create_comprehensive_dataset(symbol, selected_timeframe)
+            
+            # ENHANCEMENT 1: Get multi-timeframe data if enabled
+            multi_timeframe_data = None
+            if use_multi_timeframe:
+                with st.spinner("Analyzing multiple timeframes..."):
+                    multi_timeframe_data = fetch_multi_timeframe_data(symbol, selected_timeframe)
         
         if not data.empty:
             # Display data source information
@@ -1856,8 +2699,8 @@ def show_dashboard():
         st.subheader("Signal Analysis")
         
         if not data.empty:
-            # Generate signal using comprehensive data
-            signal = generate_signals(data_with_indicators, selected_timeframe)
+            # Generate signal using comprehensive data and multi-timeframe analysis
+            signal = generate_signals(data_with_indicators, selected_timeframe, multi_timeframe_data)
             
             # Get current price information
             current_price = data.loc[data.index[-1], 'close']
@@ -1873,6 +2716,84 @@ def show_dashboard():
                     st.markdown(f"<p class='sell-signal'>🔴 SELL SIGNAL - {signal['confidence']}% Confidence</p>", unsafe_allow_html=True)
                 else:
                     st.markdown(f"<p class='neutral-signal'>⚪ NEUTRAL - {signal['confidence']}% Confidence</p>", unsafe_allow_html=True)
+                
+                # ENHANCEMENT 3: Display market regime information
+                if 'market_regime' in signal:
+                    regime_display = {
+                        'trending': 'Trending Market',
+                        'ranging': 'Ranging/Consolidation Market',
+                        'volatile': 'Volatile Market',
+                        'weak_trend': 'Weak Trend',
+                        'unknown': 'Unknown Market Regime'
+                    }
+                    regime_text = regime_display.get(signal['market_regime'], signal['market_regime'])
+                    
+                    st.markdown(f"""
+                    <div class="regime-info">
+                    🏛️ <b>Market Regime:</b> {regime_text}
+                    </div>
+                    """, unsafe_allow_html=True)
+                
+                # ENHANCEMENT 2: Display signal clarity information
+                if 'signal_clarity' in signal:
+                    clarity = signal['signal_clarity']
+                    agreement_pct = clarity['agreement_ratio'] * 100
+                    
+                    if clarity['clarity_score'] > 70:
+                        clarity_text = "Strong signal clarity with high agreement"
+                    elif clarity['clarity_score'] > 50:
+                        clarity_text = "Moderate signal clarity"
+                    else:
+                        clarity_text = "Mixed signals with low clarity"
+                    
+                    st.markdown(f"""
+                    <div class="signal-clarity-info">
+                    🔍 <b>Signal Clarity:</b> {clarity['clarity_score']:.0f}/100 ({clarity_text})<br>
+                    <b>Indicator Agreement:</b> {agreement_pct:.1f}%
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    # Display conflicts if any
+                    if clarity['conflicts'] and len(clarity['conflicts']) > 0:
+                        with st.expander("View Signal Conflicts"):
+                            for conflict in clarity['conflicts']:
+                                st.markdown(f"• **{conflict['direction']}**: {conflict['reason']} ({conflict['points']} points)")
+                
+                # Dashboard page (continued)
+                # ENHANCEMENT 1: Display multi-timeframe alignment (continued)
+                    else:
+                        st.markdown(f"""
+                        <div class="multi-timeframe-info">
+                        📊 <b>Multi-timeframe Analysis:</b> No clear alignment across timeframes
+                        </div>
+                        """, unsafe_allow_html=True)
+                
+                # ENHANCEMENT 4: Display entry signal timing information
+                if 'entry_signals' in signal and signal['entry_signals']:
+                    entry = signal['entry_signals']
+                    
+                    if entry['entry_signal']:
+                        entry_type = entry['signal_type'].replace('_', ' ').title()
+                        entry_strength = entry['strength'].title()
+                        
+                        st.markdown(f"""
+                        <div class="entry-signal-info">
+                        ⏱️ <b>Entry Signal Detected:</b> {entry_type}<br>
+                        <b>Signal Strength:</b> {entry_strength}
+                        </div>
+                        """, unsafe_allow_html=True)
+                
+                # ENHANCEMENT 5: Display historical performance if available
+                if 'historical_performance' in signal and signal['historical_performance']:
+                    hist = signal['historical_performance']
+                    
+                    if hist['total'] >= 3:  # Only show if we have enough data
+                        st.markdown(f"""
+                        <div class="historical-info">
+                        📈 <b>Historical Performance:</b> {hist['win_rate']:.1f}% Win Rate<br>
+                        <b>Sample Size:</b> {hist['total']} similar signals
+                        </div>
+                        """, unsafe_allow_html=True)
                 
                 # Display data source warning if needed
                 if data_source != 'realtime':
@@ -1895,6 +2816,12 @@ def show_dashboard():
                 # Option to execute as paper trade
                 if st.button("Execute as Paper Trade"):
                     shares = execute_paper_trade(symbol, signal['direction'], current_price, signal['confidence'], signal['timeframe'])
+                    
+                    # ENHANCEMENT 5: Store signal key for performance tracking
+                    signal_key = generate_signal_key(signal)
+                    if signal_key and symbol in st.session_state.paper_portfolio['positions']:
+                        st.session_state.paper_portfolio['positions'][symbol]['signal_key'] = signal_key
+                    
                     st.success(f"Paper trade executed: {signal['direction']} {shares} shares of {symbol} at ${current_price:.2f}")
                 
                 # Display signal breakdown with timeframes
@@ -2013,6 +2940,22 @@ def show_scanner():
     # Data completeness options
     use_comprehensive_data = st.sidebar.checkbox("Use Comprehensive Data", value=True, help="Combines daily, intraday, and real-time data for more accurate signals")
     
+    # Enable multi-timeframe analysis
+    use_multi_timeframe = st.sidebar.checkbox("Enable Multi-Timeframe Analysis", value=True, help="Analyzes multiple timeframes for signal confirmation")
+    
+    # Market regime filter
+    market_regime_filter = st.sidebar.multiselect(
+        "Filter by Market Regime",
+        ["trending", "ranging", "volatile", "weak_trend", "unknown"],
+        default=[]
+    )
+    
+    # Signal clarity filter
+    min_clarity_score = st.sidebar.slider(
+        "Minimum Signal Clarity", 
+        0, 100, 40
+    )
+    
     # Stocks to scan
     stocks_to_scan = []
     
@@ -2079,11 +3022,19 @@ def show_scanner():
                 else:
                     signals = scan_for_signals(stocks_to_scan, min_confidence, selected_timeframe)
                 
-                # Filter by direction if needed
+                # Apply filters
                 if signal_direction == "Buy Only":
                     signals = [s for s in signals if s['direction'] == 'BUY']
                 elif signal_direction == "Sell Only":
                     signals = [s for s in signals if s['direction'] == 'SELL']
+                
+                # Apply market regime filter if selected
+                if market_regime_filter:
+                    signals = [s for s in signals if 'market_regime' in s and s['market_regime'] in market_regime_filter]
+                
+                # Apply signal clarity filter
+                if min_clarity_score > 0:
+                    signals = [s for s in signals if 'signal_clarity' in s and s['signal_clarity']['clarity_score'] >= min_clarity_score]
                 
                 if signals:
                     # Store signals in session state
@@ -2107,6 +3058,11 @@ def show_scanner():
                             # Execute the paper trade
                             shares = execute_paper_trade(symbol, direction, price, confidence, timeframe)
                             
+                            # ENHANCEMENT 5: Store signal key for performance tracking
+                            signal_key = generate_signal_key(signal)
+                            if signal_key and symbol in st.session_state.paper_portfolio['positions']:
+                                st.session_state.paper_portfolio['positions'][symbol]['signal_key'] = signal_key
+                            
                             st.success(f"Paper trade executed: {direction} {shares} shares of {symbol} at ${price:.2f}")
                     
                     # Display signals in a table first (summary)
@@ -2122,14 +3078,23 @@ def show_scanner():
                             if abs(price_diff) > 1.0:  # If difference is significant
                                 price_display += f" (Δ {price_diff:.1f}%)"
                         
+                        # Add market regime info
+                        regime = signal.get('market_regime', 'unknown')
+                        
+                        # Add signal clarity info
+                        clarity_score = "N/A"
+                        if 'signal_clarity' in signal:
+                            clarity_score = f"{signal['signal_clarity']['clarity_score']:.0f}/100"
+                        
                         signal_data.append({
                             'Symbol': signal['symbol'],
                             'Direction': signal['direction'],
                             'Confidence': f"{signal['confidence']}%",
                             'Last Price': price_display,
+                            'Market Regime': regime.capitalize(),
+                            'Signal Clarity': clarity_score,
                             'Timeframe': timeframe_str,
-                            'Data Source': data_source,
-                            'Time': signal['timestamp']
+                            'Data Source': data_source
                         })
                     
                     df_signals = pd.DataFrame(signal_data)
@@ -2161,6 +3126,72 @@ def show_scanner():
                         ℹ️ <b>Data Source:</b> {source_text}
                         </div>
                         """, unsafe_allow_html=True)
+                        
+                        # ENHANCEMENT 3: Display market regime information
+                        if 'market_regime' in signal:
+                            regime_display = {
+                                'trending': 'Trending Market',
+                                'ranging': 'Ranging/Consolidation Market',
+                                'volatile': 'Volatile Market',
+                                'weak_trend': 'Weak Trend',
+                                'unknown': 'Unknown Market Regime'
+                            }
+                            regime_text = regime_display.get(signal['market_regime'], signal['market_regime'])
+                            
+                            st.markdown(f"""
+                            <div class="regime-info">
+                            🏛️ <b>Market Regime:</b> {regime_text}
+                            </div>
+                            """, unsafe_allow_html=True)
+                        
+                        # ENHANCEMENT 2: Display signal clarity information
+                        if 'signal_clarity' in signal:
+                            clarity = signal['signal_clarity']
+                            agreement_pct = clarity['agreement_ratio'] * 100
+                            
+                            if clarity['clarity_score'] > 70:
+                                clarity_text = "Strong signal clarity with high agreement"
+                            elif clarity['clarity_score'] > 50:
+                                clarity_text = "Moderate signal clarity"
+                            else:
+                                clarity_text = "Mixed signals with low clarity"
+                            
+                            st.markdown(f"""
+                            <div class="signal-clarity-info">
+                            🔍 <b>Signal Clarity:</b> {clarity['clarity_score']:.0f}/100 ({clarity_text})<br>
+                            <b>Indicator Agreement:</b> {agreement_pct:.1f}%
+                            </div>
+                            """, unsafe_allow_html=True)
+                        
+                        # ENHANCEMENT 1: Display multi-timeframe alignment if available
+                        if 'multi_timeframe_alignment' in signal and signal['multi_timeframe_alignment']:
+                            mtf = signal['multi_timeframe_alignment']
+                            
+                            if mtf['aligned']:
+                                alignment_direction = "Bullish" if mtf['direction'] == 'bullish' else "Bearish"
+                                alignment_score = mtf['score'] * 100
+                                
+                                st.markdown(f"""
+                                <div class="multi-timeframe-info">
+                                📊 <b>Multi-timeframe Alignment:</b> {alignment_direction} across {mtf['timeframes_analyzed']} timeframes<br>
+                                <b>Alignment Strength:</b> {alignment_score:.1f}%
+                                </div>
+                                """, unsafe_allow_html=True)
+                        
+                        # ENHANCEMENT 4: Display entry signal timing information
+                        if 'entry_signals' in signal and signal['entry_signals']:
+                            entry = signal['entry_signals']
+                            
+                            if entry['entry_signal']:
+                                entry_type = entry['signal_type'].replace('_', ' ').title()
+                                entry_strength = entry['strength'].title()
+                                
+                                st.markdown(f"""
+                                <div class="entry-signal-info">
+                                ⏱️ <b>Entry Signal Detected:</b> {entry_type}<br>
+                                <b>Signal Strength:</b> {entry_strength}
+                                </div>
+                                """, unsafe_allow_html=True)
                         
                         # Display price comparison warning if significant difference
                         if 'prev_close' in signal and 'price_diff_pct' in signal and abs(signal['price_diff_pct']) > 1.0:
@@ -2194,6 +3225,12 @@ def show_scanner():
                                 signal['confidence'],
                                 signal.get('timeframe', 'Medium-term')
                             )
+                            
+                            # ENHANCEMENT 5: Store signal key for performance tracking
+                            signal_key = generate_signal_key(signal)
+                            if signal_key and signal['symbol'] in st.session_state.paper_portfolio['positions']:
+                                st.session_state.paper_portfolio['positions'][signal['symbol']]['signal_key'] = signal_key
+                            
                             st.success(f"Paper trade executed: {signal['direction']} {shares} shares of {signal['symbol']} at ${signal['last_price']:.2f}")
                         
                         # Add a separator between signals
@@ -2347,7 +3384,7 @@ def show_real_time_monitor():
         time.sleep(1500)  # 25 minutes
         st.rerun()
 
-# Documentation page
+# Documentation page (continued)
 def show_documentation():
     st.title("📚 Enhanced Technical Trading Signal System")
     
@@ -2369,6 +3406,14 @@ def show_documentation():
         6. **Timeframe Analysis**: Categorizes optimal holding periods
         7. **Paper Trading**: Virtual portfolio to test signals without real money
         8. **Data Integration**: Seamless combination of all data sources for accurate analysis
+        
+        ### New Enhanced Features
+        
+        1. **Multi-Timeframe Alignment**: Analyzes multiple timeframes to ensure trends align
+        2. **Signal Clarity & Conflict Resolution**: Measures the agreement between indicators
+        3. **Market Regime Detection**: Adapts to ranging, trending, or volatile markets
+        4. **Entry Timing System**: Identifies optimal entry points on shorter timeframes
+        5. **Statistical Performance Tracking**: Learns from historical signal performance
         
         The system requires a minimum 65% confidence score to display trading signals.
         """)
@@ -2413,57 +3458,119 @@ def show_documentation():
         The overall timeframe recommendation is based on the strongest signals present.
         """)
     
-    with st.expander("📊 Core Indicators"):
+    with st.expander("🔄 Multi-Timeframe Analysis"):
         st.markdown("""
-        ### Primary Indicators
+        ### Multi-Timeframe Alignment System
         
-        #### MACD (Moving Average Convergence Divergence)
+        The multi-timeframe analysis system examines the same stock across different timeframes to ensure trend alignment:
         
-        **What it is**: Trend-following momentum indicator showing relationship between 12-day and 26-day EMAs
+        | Main Trading Timeframe | Timeframes Analyzed |
+        |------------------------|---------------------|
+        | Short-term (1-7 days) | 15min, 1h, Daily |
+        | Medium-term (1-4 weeks) | 1h, Daily, Weekly |
+        | Long-term (1-3 months) | Daily, Weekly, Monthly |
         
-        **Signal strength**: 15 points for crossover signals
+        #### How It Works
         
-        **Optimal timeframe**: Medium-term (2-4 weeks)
+        1. **Indicator Agreement**: Checks if the same indicators show the same direction across timeframes
+        2. **Alignment Score**: Calculates a 0-100% score based on how well timeframes align
+        3. **Confidence Boost**: Adds up to 10 points to signal confidence when timeframes align
+        4. **Conflict Detection**: Warns when higher timeframes contradict the main timeframe
         
-        ---
+        This approach significantly reduces false signals by ensuring you're trading in the direction of the larger trends.
+        """)
+    
+    with st.expander("🧠 Market Regime Detection"):
+        st.markdown("""
+        ### Market Regime Detection System
         
-        #### RSI (Relative Strength Index)
+        The system now automatically detects the current market regime and adapts indicator weights accordingly:
         
-        **What it is**: Momentum oscillator measuring overbought/oversold conditions
+        | Regime | Characteristics | Best Indicators |
+        |--------|-----------------|-----------------|
+        | Trending | ADX > 25, clear directional movement | MACD, EMAs, ADX |
+        | Ranging | Tight price consolidation, low ADX | RSI, Bollinger Bands, Stochastic |
+        | Volatile | High price variance, erratic moves | Volume, ATR, Bollinger width |
+        | Weak Trend | Slight directionality, ADX 15-25 | Combination of trend and range |
         
-        **Signal strength**: 10 points for overbought/oversold
+        #### How It Works
         
-        **Optimal timeframe**: Short-term (3-5 days)
+        1. **Detection Metrics**: Uses ADX, Bollinger Band width, price volatility, and MA angles
+        2. **Dynamic Weighting**: Adjusts the importance of each indicator based on the detected regime
+        3. **Signal Targeting**: Focuses on range-bound signals in ranging markets, trend signals in trending markets
         
-        ---
+        This adaptive approach ensures you're using the right tools for the current market conditions.
+        """)
+    
+    with st.expander("🔍 Signal Clarity & Conflict Resolution"):
+        st.markdown("""
+        ### Signal Clarity System
         
-        #### Bollinger Bands
+        The signal clarity system measures how strongly indicators agree with each other:
         
-        **What it is**: Volatility bands around price movement
+        #### Clarity Metrics
         
-        **Signal strength**: 10 points for price near bands
+        - **Agreement Ratio**: Percentage of indicators agreeing on direction (BUY or SELL)
+        - **Clarity Score**: 0-100 score based on agreement level and conflicting signals
+        - **Conflict Identification**: Lists specific indicators that contradict the main signal
         
-        **Optimal timeframe**: Short-term (3-7 days)
+        #### How It Affects Confidence
         
-        ---
+        - **High Clarity (75-100)**: Boosts confidence score (+5 points max)
+        - **Medium Clarity (40-75)**: No adjustment
+        - **Low Clarity (<40)**: Reduces confidence score (-10 points max)
         
-        #### EMA Cloud (8 & 21)
+        This system helps you focus on high-conviction signals where multiple indicators point in the same direction.
+        """)
+    
+    with st.expander("⏱️ Entry Timing System"):
+        st.markdown("""
+        ### Entry Timing System
         
-        **What it is**: Trend identification using short-term EMAs
+        Once a trading signal is generated, the entry timing system helps you pinpoint optimal entry points:
         
-        **Signal strength**: 10 points for alignment
+        #### For BUY Signals
         
-        **Optimal timeframe**: Short-term (1-2 weeks)
+        - MACD crossing above signal line
+        - RSI bouncing from oversold (<30)
+        - Price crossing above short-term EMA
+        - Bollinger Band bounce from lower band
         
-        ---
+        #### For SELL Signals
         
-        #### Long-term Trend (EMA50 vs EMA200)
+        - MACD crossing below signal line
+        - RSI dropping from overbought (>70)
+        - Price crossing below short-term EMA
+        - Bollinger Band breakdown from upper band
         
-        **What it is**: Long-term trend alignment
+        #### Signal Strength Classification
         
-        **Signal strength**: 10 points
+        - **Strong**: High-probability entry signals (RSI extremes, BB touches)
+        - **Moderate**: Medium-probability signals (MA crossovers)
         
-        **Optimal timeframe**: Long-term (1-3 months)
+        This system prevents late entries and helps you time your trades more effectively.
+        """)
+    
+    with st.expander("📊 Statistical Performance Tracking"):
+        st.markdown("""
+        ### Signal Performance Tracking
+        
+        The system now tracks historical performance of each signal type:
+        
+        #### How It Works
+        
+        1. **Signal Fingerprinting**: Creates a unique key for each signal pattern
+        2. **Win/Loss Tracking**: Records outcomes when trades are closed
+        3. **Performance Metrics**: Win rate, sample size, average return
+        4. **Confidence Adjustment**: Boosts confidence for historically successful patterns, reduces for poor performers
+        
+        #### Benefits
+        
+        - System learns from its own performance
+        - Higher confidence in signals with proven track records
+        - Helps identify which indicator combinations work best
+        
+        This creates a self-improving system that gets smarter with each trade.
         """)
     
     with st.expander("📝 Paper Trading System"):
@@ -2478,6 +3585,7 @@ def show_documentation():
         - **Trade History**: Records all closed positions with performance metrics
         - **Performance Analytics**: Win rate, average return, total P&L
         - **Data Persistence**: Your portfolio data is saved automatically between sessions
+        - **Signal Performance Tracking**: Stores which signal types produce the best results
         
         You can execute trades manually from the dashboard or scanner, or set it to automatically execute new signals.
         """)
@@ -2526,19 +3634,19 @@ def show_documentation():
         
         #### Best Practices
         
-        1. **Timeframe Alignment**: Trade according to the recommended holding period
+        1. **Multi-Timeframe Alignment**: Only take trades where multiple timeframes agree
         
-        2. **Confirmation**: Look for multiple indicators supporting the same direction
+        2. **Signal Clarity Focus**: Prioritize signals with high clarity scores (>70)
         
-        3. **Strong Trends**: Pay attention to ADX values above 25 (indicates strong trend)
+        3. **Market Regime Awareness**: Use trend indicators in trending markets, oscillators in ranging markets
         
-        4. **Volume Confirmation**: Ensure signals are supported by above-average volume
+        4. **Entry Timing**: Wait for an entry signal after a main signal is detected
         
-        5. **Risk Management**: Always use stop-losses (typically 5-7% for swing trades)
+        5. **Signal Performance**: Pay attention to the historical performance of signal types
         
-        6. **Price Verification**: Check that real-time prices confirm historical data analysis
+        6. **Risk Management**: Always use stop-losses (typically 5-7% for swing trades)
         
-        7. **Data Source Awareness**: Be mindful of which data source is being used for analysis
+        7. **Position Sizing**: Let confidence score guide position size (higher confidence = larger position)
         
         #### Risk Management Guidelines
         
@@ -2559,8 +3667,10 @@ def show_documentation():
         
         3. **API Keys**: Your API keys are securely stored and loaded when the application starts
         
+        4. **Signal Performance History**: Historical performance of different signal types is tracked and saved
+        
         Data is saved in the following files:
-        - `paper_trading_data.pkl`: Contains your paper trading portfolio data
+        - `paper_trading_data.pkl`: Contains your paper trading portfolio data and signal performance
         - `api_keys.json`: Contains your API keys for Alpha Vantage and Finnhub
         
         You can manually save your data at any time using the "Save Portfolio Data" button in the Paper Trading section.
@@ -2580,25 +3690,6 @@ def show_documentation():
         
         The 25-minute refresh option is particularly useful for managing API rate limits with Alpha Vantage,
         as it allows you to refresh just before the hourly quota resets.
-        """)
-        
-    with st.expander("🔁 Recent Improvements"):
-        st.markdown("""
-        ### New Enhancements
-        
-        The latest version includes these key improvements:
-        
-        1. **Complete Data Integration**: Added intraday data from Alpha Vantage to bridge the gap between historical and real-time data
-        
-        2. **Data Source Tracking**: Each price point is now tagged with its source for transparency
-        
-        3. **Enhanced Visualizations**: Charts now include all data sources seamlessly integrated
-        
-        4. **Improved Signal Accuracy**: Technical indicators now calculate with complete data for better signals
-        
-        5. **Comprehensive Scanner**: The stock scanner now uses all available data sources for more accurate signals
-        
-        6. **Extended Documentation**: Added detailed information about the data integration approach
         """)
 
 if __name__ == "__main__":
